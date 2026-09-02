@@ -4,3 +4,5 @@ logs/
 __pycache__/
 *.pyc
 .DS_Store
+local-config.sh
+local-config.md

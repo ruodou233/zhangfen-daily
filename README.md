@@ -1,4 +1,6 @@
-# growth-radar
+# 社交媒体涨粉与内容研究｜Social Media Growth Research
+
+Research social media follower growth through creator rankings, published content, and public comments.
 
 哪些账号突然长起来了，什么作品值得拆，评论里的人又在为什么买账？growth-radar 是一套跨平台内容研究机制：从涨粉榜和连续观测里找候选，结合公开作品、评论和事件线索，筛掉明显受入驻、回归、活动等因素影响的案例，再把值得看的内容往下拆。榜单是找线索的起点，研究最后要落到具体作品上。
 

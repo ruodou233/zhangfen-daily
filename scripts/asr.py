@@ -1,7 +1,7 @@
-"""转写：python asr.py <媒体文件或 URL> [--headers "K: V\\r\\n..."] [--model <本地模型目录>] [--max-sec 1800]
+"""转写：python asr.py <媒体文件或 URL> [--language zh] [--headers "K: V\\r\\n..."] [--model <本地模型目录>] [--max-sec 1800]
 
 ffmpeg 直接从文件或 URL 流式抽前 max-sec 秒的 16k 单声道 PCM，mlx-whisper 用本地 whisper-large-v3-turbo 转写，
-纯文本按句换行写到 stdout，长于 max-sec 时末尾注明只转了前一段。
+不给 --language 就自动识别语言。纯文本按句换行写到 stdout，长于 max-sec 时末尾注明只转了前一段。
 抽完音频先往 stderr 打一行 `duration <秒>`，调用方据此定超时。没转出有效语音时输出为空。
 """
 import argparse
@@ -17,20 +17,26 @@ import time
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 # 纯音乐、静音段上 whisper 常编出这些固定说法；v3-turbo 的 no_speech_prob 不可靠，靠置信度和黑名单
-HALLUCINATION = re.compile(r"字幕(志愿者|制作|提供|翻译|校对|由|组)|^(中文)?字幕[\s:：]|Amara|明镜|点点栏目|不吝|独播剧场|YoYo"
-                           r"|谢谢观看|感谢观看|感谢收看|订阅.{0,8}转发")
+HALLUCINATION = {
+    "zh": re.compile(r"字幕(志愿者|制作|提供|翻译|校对|由|组)|^(中文)?字幕[\s:：]|Amara|明镜|点点栏目|不吝|独播剧场|YoYo"
+                     r"|谢谢观看|感谢观看|感谢收看|订阅.{0,8}转发"),
+}
 KANA = re.compile(r"[\u3040-\u30ff]")
 LETTER = re.compile(r"[\u3040-\u30ff\u4e00-\u9fffA-Za-z]")
 
 
-def speech(seg):
+def speech(seg, lang):
     t = seg["text"].strip()
-    if not t or HALLUCINATION.search(t):
+    if not re.search(r"\w", t):  # 只有标点
+        return ""
+    if not seg.get("avg_logprob", 0) >= -1.0 or seg.get("compression_ratio", 0) > 2.4:  # 低置信、复读；NaN 也丢
+        return ""
+    if seg["end"] - seg["start"] >= 20 and len(t) < 20:  # 整个窗口只出一句短话（Thank you. 之类），多半是音乐上编的
+        return ""
+    if lang in HALLUCINATION and HALLUCINATION[lang].search(t):
         return ""
     kana = len(KANA.findall(t))
-    if kana and kana >= 0.5 * len(LETTER.findall(t)):  # 整段是日文：强制中文时这多半是幻觉
-        return ""
-    if not seg.get("avg_logprob", 0) >= -1.0 or seg.get("compression_ratio", 0) > 2.4:  # NaN 也丢
+    if lang == "zh" and kana and kana >= 0.5 * len(LETTER.findall(t)):  # 整段是日文：按中文转时这多半是幻觉
         return ""
     return t
 
@@ -74,6 +80,7 @@ def exit_with_parent():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("media")
+    ap.add_argument("--language", default=None)
     ap.add_argument("--headers", default="")
     ap.add_argument("--model", default=None)
     ap.add_argument("--max-sec", type=int, default=1800)
@@ -100,10 +107,15 @@ def main():
         return
 
     import mlx_whisper
-    r = mlx_whisper.transcribe(audio, path_or_hf_repo=model, language="zh",
-                               initial_prompt="以下是普通话的句子，使用简体中文和标点。",
+    from mlx_whisper.tokenizer import LANGUAGES
+    lang = re.split(r"[-_]", (a.language or "").lower())[0]
+    lang = lang if lang in LANGUAGES else None  # und、zxx 之类交给自动识别
+    # 温度回退只留两档：默认六档在配乐多的片段上会把一个窗口反复重解码，耗时翻倍，结果也不更好
+    r = mlx_whisper.transcribe(audio, path_or_hf_repo=model, language=lang, temperature=(0.0, 0.4),
+                               initial_prompt="以下是普通话的句子，使用简体中文和标点。" if lang == "zh" else None,
                                condition_on_previous_text=False)
-    text = "\n".join(t for t in map(speech, r["segments"]) if t)
+    lines = [t for t in (speech(seg, r.get("language") or lang) for seg in r["segments"]) if t]
+    text = "\n".join(t for i, t in enumerate(lines) if i == 0 or t != lines[i - 1])  # 连续重复的同一句只留一次
     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", log)
     full = int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else None
     if text and len(audio) >= (a.max_sec - 1) * 16000 and (full is None or full > a.max_sec + 1):

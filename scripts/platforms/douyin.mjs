@@ -1,4 +1,4 @@
-// 抖音：飞瓜日涨粉榜（免登录 HTTP）→ 飞瓜详情页拿 uid → 换成 sec_uid（缓存 → 直播用户接口 → 浏览器搜抖音号）
+// 抖音：飞瓜日涨粉榜（免登录 HTTP）→ 飞瓜详情页拿 uid 和逐日涨粉 → 换成 sec_uid（缓存 → 直播用户接口 → 浏览器搜抖音号）
 // → 浏览器打开创作者主页读作品列表（aweme/post 接口）→ 文案 = 简介 + 视频转写。
 import fs from 'node:fs';
 import path from 'node:path';
@@ -61,13 +61,24 @@ export async function board(ctx) {
   };
 }
 
-// 飞瓜详情页：抖音 uid、抖音号（未设置时是短 id）、昵称；没有 sec_uid
+// 飞瓜详情页：抖音 uid、抖音号（未设置时是短 id）、昵称、近 90 天逐日涨粉（x 是北京时间零点）；没有 sec_uid
 async function feiguaProfile(ctx, url) {
   const html = await ctx.http.text(url);
   const pick = (re) => html.match(re)?.[1];
   const uid = pick(/data-uid="(\d+)"/) ?? pick(/iesdouyin\.com\/share\/user\/(\d+)/);
   if (!uid) throw new Error(`飞瓜详情页没有抖音 uid：${url}`);
-  return { uid, douyinId: pick(/抖音号：<span>([^<]+)<\/span>/)?.trim(), nickname: unescape(pick(/data-nickname="([^"]*)"/) ?? '') };
+  let fansInc = [];
+  try { fansInc = JSON.parse(pick(/var fansInc90 = (\[[^\]]*\])/)); } catch {}
+  return { uid, douyinId: pick(/抖音号：<span>([^<]+)<\/span>/)?.trim(), nickname: unescape(pick(/data-nickname="([^"]*)"/) ?? ''), fansInc };
+}
+
+function peakDay(fansInc, board, window) {
+  const end = Date.parse(`${board.date}T00:00:00+08:00`);
+  let peak = null;
+  for (const { x, y } of fansInc) {
+    if (x >= end - window * DAY && x <= end && !(peak?.gain >= y)) peak = { date: cstISO(x).slice(0, 10), gain: y };
+  }
+  return peak;
 }
 
 const SEARCH = /aweme\/v1\/web\/discover\/search/;
@@ -164,6 +175,7 @@ export async function works(ctx, entry, board) {
     creator: { id: fg.uid, name: own?.nickname || fg.nickname || entry.name, url, followers: followers ?? entry.followers },
     works: inWindow.map(toWork),
     note: more && earliest > start ? `主页只取了 ${used} 页，窗口内至少 ${inWindow.length} 条` : '',
+    peak: peakDay(fg.fansInc, board, ctx.opts.window),
   };
 }
 
@@ -197,7 +209,7 @@ export async function copy(ctx, work) {
     return { source: 'text', text: work.desc };
   }
   // asr 没有人声时返回空串，这时只用简介
-  const speech = (await ctx.asr(work.media.url, { headers: work.media.headers })).trim();
+  const speech = (await ctx.asr(work.media.url, { headers: work.media.headers, language: 'zh' })).trim();
   if (!speech && !work.desc) throw new Error('没有简介，视频里也没有人声');
   if (!speech) return { source: 'text', text: work.desc };
   if (!work.desc) return { source: 'asr', text: speech };

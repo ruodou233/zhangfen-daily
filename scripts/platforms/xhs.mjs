@@ -1,6 +1,6 @@
 // 小红书：千瓜日涨粉榜（免登录 HTTP）→ 浏览器里按昵称站内搜索，用头像 key / 昵称 / 粉丝量确认身份
 // → 创作者主页首屏笔记（带 xsec_token 和发布时间）→ 窗口内点赞最高的 --copy 条打开详情取正文、互动数据、视频地址。
-// 文案 = 标题 + 正文，视频笔记再加转写。确认过的身份缓存在 <out>/cache/xhs_user.json，再上榜直接开主页复核。
+// 文案 = 标题 + 正文，视频笔记再加转写；热评取详情页自己加载的第一页评论。确认过的身份缓存在 <out>/cache/xhs_user.json，再上榜直接开主页复核。
 import fs from 'node:fs';
 import path from 'node:path';
 
@@ -11,6 +11,7 @@ const XHS = 'https://www.xiaohongshu.com';
 const DAY = 86_400_000;
 const CST = 8 * 3_600_000;
 const SEARCH_API = /\/api\/sns\/web\/v\d\/search\/(onebox|usersearch|notes)/;
+const COMMENT_API = /\/api\/sns\/web\/v\d\/comment\/page/;
 const RISK = /IP存在风险|安全验证|访问频繁|账号异常|安全限制|captcha/i;
 
 const rankUrl = (ymd) => `${QG}/rank/fans/1/1/${ymd}/0.html`;
@@ -129,14 +130,14 @@ function candidates(responses) {
   for (const { url, body } of responses) {
     const d = body?.data;
     if (/onebox/.test(url)) for (const { user_one_box: u } of d?.onebox_list ?? []) {
-      if (u) add({ id: u.id, name: u.title, fans: num(u.fans), avatar: avatarKey(u.image), token: u.xsec_token });
+      if (u) add({ id: u.id, name: u.title, fans: num(u.fans), avatar: avatarKey(u.image) });
     }
     if (/usersearch/.test(url)) for (const u of d?.users ?? []) {
-      add({ id: u.id, name: u.name, fans: num(u.fans), avatar: avatarKey(u.image), token: u.xsec_token });
+      add({ id: u.id, name: u.name, fans: num(u.fans), avatar: avatarKey(u.image) });
     }
     if (/notes/.test(url)) for (const it of d?.items ?? []) {
       const u = it.note_card?.user;
-      if (u) add({ id: u.user_id, name: u.nickname ?? u.nick_name, avatar: avatarKey(u.avatar), token: u.xsec_token });
+      if (u) add({ id: u.user_id, name: u.nickname ?? u.nick_name, avatar: avatarKey(u.avatar) });
     }
   }
   return [...byId.values()];
@@ -207,10 +208,13 @@ function remember(ctx, entry, user) {
 
 // ---------- 作品 ----------
 
+// 主页数据就绪才返回：资料在、且笔记列表非空（posted 为 0 的账号除外）。列表一般随页面直出，
+// 偶尔要等前端自己拉第一页，这期间资料已经有了而列表还是空的，过早读会得到"窗口内 0 条"。
 const PROFILE_JS = `(()=>{const un=x=>x&&(x._rawValue??x._value??x);const u=window.__INITIAL_STATE__?.user;const d=un(u?.userPageData);
-  if(!d?.basicInfo)return null;const notes=un(u.notes);
+  if(!d?.basicInfo)return null;const notes=un(u.notes);const first=(Array.isArray(notes)&&Array.isArray(notes[0])?notes[0]:[]).map(un);
+  if(!first.length&&d.posted!==0)return null;
   return {name:d.basicInfo.nickname,avatar:d.basicInfo.images,fans:(d.interactions||[]).find(i=>i.type==='fans')?.count,
-    notes:(Array.isArray(notes)&&Array.isArray(notes[0])?notes[0]:[]).map(un).map(n=>({id:n.noteCard?.noteId||n.id,token:n.xsecToken||n.noteCard?.xsecToken,
+    notes:first.map(n=>({id:n.noteCard?.noteId||n.id,token:n.xsecToken||n.noteCard?.xsecToken,
       title:n.noteCard?.displayTitle,type:n.noteCard?.type,time:n.noteCard?.time,likes:n.noteCard?.interactInfo?.likedCount}))}})()`;
 
 // 视频取带音轨的 mp4 里码率最低的一路（.m4s 是 DASH 纯视频流，没有声音）
@@ -223,8 +227,10 @@ const noteJs = (id) => `(()=>{const un=x=>x&&(x._rawValue??x._value??x);const n=
 // 正文里的话题标记 '#xxx[话题]#' 还原成 '#xxx'
 const tidy = (s) => (s ?? '').replace(/#([^#\n]+?)\[话题\]#/g, '#$1 ').replace(/^[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 
+const hot = new Map(); // 笔记 id → 热评，copy() 时交给 run.mjs
+
 async function fillDetail(ctx, work) {
-  const { page, value: d, gone } = await visit(ctx, work.url, (p) => p.eval(noteJs(work.id)));
+  const { page, value: d, gone } = await visit(ctx, work.url, (p) => p.eval(noteJs(work.id)), [COMMENT_API]);
   try {
     if (!d) throw new Error(gone ? `笔记打不开（${gone}）` : '笔记详情 15 秒内没加载出来');
     work.title = d.title || work.title;
@@ -233,17 +239,21 @@ async function fillDetail(ctx, work) {
     work.metrics = { plays: null, likes: num(d.i?.likedCount), comments: num(d.i?.commentCount), collects: num(d.i?.collectedCount), shares: num(d.i?.shareCount) };
     work.desc = tidy(d.desc);
     work.media = d.video && { url: d.video.url, duration: d.video.duration, headers: { Referer: `${XHS}/` } };
+    // 评论接口先有一次 CORS 预检（没有响应体），等带 comments 的那次
+    const res = await page.waitFor(() => page.responses.find((r) => r.body?.data?.comments), 6000).catch(() => null);
+    hot.set(work.id, (res?.body.data.comments ?? []).map((c) => ({ text: c.content ?? '', likes: num(c.like_count) ?? 0 }))
+      .sort((a, b) => b.likes - a.likes).slice(0, 10));
   } finally {
     await page.close();
   }
 }
 
-// 首屏笔记是服务端渲染进 __INITIAL_STATE__ 的，一出现就读，不等页面自己往下加载。登录态下不带 xsec_token 也能打开主页。
-async function loadProfile(ctx, id, token) {
-  const q = token ? `?xsec_token=${encodeURIComponent(token)}&xsec_source=pc_search` : '';
-  const { page, value, gone } = await visit(ctx, `${XHS}/user/profile/${id}${q}`, (p) => p.eval(PROFILE_JS));
+// 搜索确认和缓存复核两条路径都用同一个地址新开主页（登录态下不带 xsec_token 也能打开），首屏笔记一就绪就读，不等页面自己往下加载
+async function loadProfile(ctx, id) {
+  const { page, value, gone } = await visit(ctx, `${XHS}/user/profile/${id}`, (p) => p.eval(PROFILE_JS));
   await page.close();
-  if (!value) throw new Error(`账号 ${id} 的主页${gone ? `打不开（${gone}）` : '数据没加载出来'}`);
+  if (!value) throw new Error(`账号 ${id} 的主页${gone ? `打不开（${gone}）` : '资料或笔记列表 15 秒内没加载出来'}`);
+  if (value.notes.length && !value.notes.some((n) => n.token)) throw new Error(`账号 ${id} 主页的笔记都没有 xsec_token，打不开详情`);
   return value;
 }
 
@@ -260,7 +270,7 @@ export async function works(ctx, entry, board) {
   }
   if (!user) {
     user = await findUser(ctx, entry);
-    profile = await loadProfile(ctx, user.id, user.token);
+    profile = await loadProfile(ctx, user.id);
   }
   ctx.log(`${entry.name} → ${user.name}（${user.id}，${via}：${user.signals.join('+')}吻合）`);
   remember(ctx, entry, user);
@@ -307,9 +317,10 @@ export async function works(ctx, entry, board) {
 export async function copy(ctx, work) {
   if (work.desc == null) await fillDetail(ctx, work); // works() 里没开过详情的，这时补开
   const text = [work.title, work.desc].map((s) => s?.trim()).filter(Boolean).join('\n\n');
-  if (work.type !== 'video') return { source: 'text', text };
+  const comments = hot.get(work.id) ?? [];
+  if (work.type !== 'video') return { source: 'text', text, comments };
   if (!work.media?.url) throw new Error('没取到视频地址');
   ctx.log(`${work.id} 视频笔记，转写（${work.media.duration ?? '?'} 秒）`);
-  const asr = (await ctx.asr(work.media.url, { headers: work.media.headers })).trim(); // 没转出有效语音时为空
-  return { source: 'text+asr', text: asr ? `${text}\n\n【视频转写】\n${asr}`.trim() : text };
+  const asr = (await ctx.asr(work.media.url, { headers: work.media.headers, language: 'zh' })).trim(); // 没转出有效语音时为空
+  return { source: 'text+asr', text: asr ? `${text}\n\n【视频转写】\n${asr}`.trim() : text, comments };
 }

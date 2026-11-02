@@ -1,4 +1,5 @@
 // 转写：媒体 URL（连同请求头）或本地文件直接交给 asr.py，ffmpeg 边下边抽音频。超时按音频时长给。
+// 一个实例内串行：多个平台并行时同一时刻也只有一个 ffmpeg + mlx 进程（单个就要 2GB 上下内存）。
 import { spawn, execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,17 +27,23 @@ function findPython(explicit) {
   throw new Error('找不到装了 mlx-whisper 的 Python（用 --python 或 ZF_PYTHON 指定）');
 }
 
-export function createAsr({ python, log = () => {} } = {}) {
+export function createAsr({ python, log: baseLog = () => {} } = {}) {
   let py;
-  return async function asr(input, { headers = {} } = {}) {
+  let queue = Promise.resolve();
+  let pending = 0;
+  // language：whisper 语言代码（'zh'、'en'、'en-US' 也行）；不给就自动识别。log 可按调用覆盖（并行时带上平台名）
+  return async function asr(input, { headers = {}, language, log = baseLog } = {}) {
     py ??= (() => { try { return findPython(python); } catch (e) { return e; } })();
     if (py instanceof Error) throw py;
-    const args = [SCRIPT, input];
+    const args = [SCRIPT, input, ...(language ? ['--language', language] : [])];
     if (/^https?:/.test(input)) {
       const h = { 'User-Agent': UA, ...headers };
       args.push('--headers', Object.entries(h).map(([k, v]) => `${k}: ${v}\r\n`).join(''));
     }
-    return transcribe(py, args, log);
+    if (pending++) log(`排队等转写（前面还有 ${pending - 1} 个）`);
+    const run = queue.then(() => transcribe(py, args, log)).finally(() => { pending--; });
+    queue = run.catch(() => {});
+    return run;
   };
 }
 

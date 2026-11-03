@@ -182,28 +182,57 @@ async function peakDay(ctx, id, board) {
   return peak;
 }
 
+// 最近 15 条上传。RSS 发布时间精确到秒、带播放和点赞；RSS 偶尔整片 404，这时改读上传列表（UU 播放列表，长视频、Shorts、
+// 直播回放混排，按发布时间倒序），它只有「x 天前」折算的近似日期，窗口留宽一点，精确时间等 -J 详情再核对
+async function uploads(ctx, id) {
+  const url = `https://www.youtube.com/feeds/videos.xml?channel_id=${id}`;
+  const res = await ctx.http.request(url).catch((e) => e);
+  if (!(res instanceof Error) && res.ok) {
+    const xml = await res.text();
+    if (!xml.includes(`/channel/${id}"`)) throw new Error(`RSS 返回的不是频道 ${id}`);
+    const tag = (s, t) => unescape(s.match(new RegExp(`<${t}>([\\s\\S]*?)</${t}>`))?.[1] ?? '').trim();
+    return {
+      src: 'RSS',
+      name: tag(xml.split('<entry>')[0], 'title'),
+      feed: [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map(([, e]) => ({
+        id: tag(e, 'yt:videoId'),
+        url: e.match(/<link rel="alternate" href="([^"]+)"/)?.[1],
+        title: tag(e, 'title'),
+        published: Date.parse(tag(e, 'published')) / 1000,
+        desc: tag(e, 'media:description'),
+        likes: e.match(/<media:starRating count="(\d+)"/)?.[1],
+        plays: e.match(/<media:statistics views="(\d+)"/)?.[1],
+      })),
+    };
+  }
+  const why = res instanceof Error ? res.message : `HTTP ${res.status}`;
+  ctx.log(`频道 ${id} 的 RSS 失败（${why}），改读上传列表`);
+  const pl = JSON.parse(await ytdlp(['--flat-playlist', '-J', '--playlist-end', '15', '--extractor-args', 'youtubetab:approximate_date',
+    `https://www.youtube.com/playlist?list=UU${id.slice(2)}`]));
+  if (pl.channel_id !== id) throw new Error(`上传列表不是频道 ${id} 的（RSS 也失败：${why}）`);
+  return {
+    src: '上传列表',
+    why,
+    name: pl.channel,
+    feed: (pl.entries ?? []).map((e) => ({
+      id: e.id, url: `https://www.youtube.com/watch?v=${e.id}`, title: e.title ?? '', published: e.timestamp ?? null, approx: true, desc: '', plays: e.view_count,
+    })),
+  };
+}
+
 export async function works(ctx, entry, board) {
   const { id } = entry.ref;
   // 逐日数据没缓存时要十几秒，和作品详情并行
   const peakP = peakDay(ctx, id, board).catch((e) => { ctx.log(`${entry.name} 订阅数跳变日取不到（${e.message}）`); return null; });
-  // RSS：最近 15 条上传（长视频、Shorts、直播回放混排），发布时间精确到秒，带播放和点赞
-  const xml = await ctx.http.text(`https://www.youtube.com/feeds/videos.xml?channel_id=${id}`);
-  if (!xml.includes(`/channel/${id}"`)) throw new Error(`RSS 返回的不是频道 ${id}`);
-  const tag = (s, t) => unescape(s.match(new RegExp(`<${t}>([\\s\\S]*?)</${t}>`))?.[1] ?? '').trim();
-  const feed = [...xml.matchAll(/<entry>([\s\S]*?)<\/entry>/g)].map(([, e]) => ({
-    id: tag(e, 'yt:videoId'),
-    url: e.match(/<link rel="alternate" href="([^"]+)"/)?.[1],
-    title: tag(e, 'title'),
-    published: Date.parse(tag(e, 'published')) / 1000,
-    desc: tag(e, 'media:description'),
-    likes: e.match(/<media:starRating count="(\d+)"/)?.[1],
-    plays: e.match(/<media:statistics views="(\d+)"/)?.[1],
-  }));
+  const { src, why, name, feed } = await uploads(ctx, id);
+  const exact = src === 'RSS';
 
   const end = zoned(board.date, '23:59:59', TZ);
   const start = zoned(board.date, '00:00:00', TZ) - ctx.opts.window * 86400;
-  const inWindow = feed.filter((v) => v.published >= start && v.published <= end);
-  const notes = [];
+  const inWindow = feed.filter((v) => (v.approx
+    ? v.published == null || (v.published >= start - 7 * 86400 && v.published <= end + 2 * 86400) // 「x 周前」误差可到一周
+    : v.published >= start && v.published <= end));
+  const notes = exact ? [] : [`RSS 失败（${why}），改读上传列表前 ${feed.length} 条`];
 
   const toWork = async (v) => {
     let info = null;
@@ -211,12 +240,14 @@ export async function works(ctx, entry, board) {
       info = await detail(v.url);
     } catch (e) {
       if (/will begin|premieres? in/i.test(e.message)) return null; // 还没开播的直播 / 首映预告
-      notes.push(`${v.id} 详情取不到（${e.message}），用 RSS 数据`);
+      notes.push(`${v.id} 详情取不到（${e.message}）${v.approx ? '，发布时间无法核对，跳过' : '，用 RSS 数据'}`);
+      if (v.approx) return null;
     }
     if (info?.live_status === 'is_upcoming') return null;
+    if (v.approx && !(info.timestamp >= start && info.timestamp <= end)) return null;
     return {
       id: v.id,
-      url: v.url,
+      url: info?.media_type === 'short' ? `https://www.youtube.com/shorts/${v.id}` : v.url,
       title: info?.title ?? v.title,
       type: 'video',
       published_at: isoLocal(info?.timestamp ?? v.published),
@@ -232,24 +263,30 @@ export async function works(ctx, entry, board) {
       media: info && media(info),
     };
   };
-  const recent = mapLimit(inWindow.slice(0, MAX_WORKS), 3, toWork);
+  // RSS 时间精确，只查最近 10 条；上传列表要逐条核对时间，候选全查
+  const recent = mapLimit(exact ? inWindow.slice(0, MAX_WORKS) : inWindow, 3, toWork);
 
   // 最近 10 条，再加上跳变日及前 3 天发布的，让峰值规则有机会命中
   const peak = await peakP;
   const peakFrom = peak && zoned(peak.date, '00:00:00', TZ) - 3 * 86400;
   const peakTo = peak && zoned(peak.date, '23:59:59', TZ);
-  const extra = peak ? inWindow.slice(MAX_WORKS).filter((v) => v.published >= peakFrom && v.published <= peakTo) : [];
-  const list = [...await recent, ...await mapLimit(extra, 3, toWork)].filter(Boolean);
+  const inPeak = (t) => !!peak && t >= peakFrom && t <= peakTo;
+  const extra = exact ? inWindow.slice(MAX_WORKS).filter((v) => inPeak(v.published)) : [];
+  let list = [...await recent, ...await mapLimit(extra, 3, toWork)].filter(Boolean);
+  const total = exact ? inWindow.length : list.length;
+  const more = exact ? extra.length : list.slice(MAX_WORKS).filter((w) => inPeak(Date.parse(w.published_at) / 1000)).length;
+  if (!exact) list = [...list.slice(0, MAX_WORKS), ...list.slice(MAX_WORKS).filter((w) => inPeak(Date.parse(w.published_at) / 1000))];
 
-  const partial = feed.length && Math.min(...feed.map((v) => v.published)) > start; // RSS 没覆盖到窗口起点
-  if (feed.length && !feed.some((v) => v.published <= end)) notes.push(`RSS 最近 ${feed.length} 条都发在榜期之后（更新太勤），窗口内作品没取到`);
-  else if (inWindow.length > MAX_WORKS) {
-    notes.push(`窗口内 ${inWindow.length}${partial ? '+' : ''} 条，只取最近 ${MAX_WORKS} 条${extra.length ? `和订阅数跳变日前后 ${extra.length} 条` : ''}`);
-  } else if (partial) notes.push(`RSS 只有最近 ${feed.length} 条，窗口内至少 ${inWindow.length} 条`);
-  ctx.log(`${entry.name}：RSS ${feed.length} 条，窗口内 ${inWindow.length} 条`);
+  const known = feed.filter((v) => v.published != null).map((v) => v.published);
+  const partial = known.length && Math.min(...known) > start; // 列表没覆盖到窗口起点
+  if (known.length && !known.some((t) => t <= end)) notes.push(`${src}最近 ${feed.length} 条都发在榜期之后（更新太勤），窗口内作品没取到`);
+  else if (total > MAX_WORKS) {
+    notes.push(`窗口内 ${total}${partial ? '+' : ''} 条，只取最近 ${MAX_WORKS} 条${more ? `和订阅数跳变日前后 ${more} 条` : ''}`);
+  } else if (partial) notes.push(`${src}只有最近 ${feed.length} 条，窗口内至少 ${total} 条`);
+  ctx.log(`${entry.name}：${src} ${feed.length} 条，窗口内 ${total} 条`);
 
   return {
-    creator: { id, name: tag(xml.split('<entry>')[0], 'title') || entry.name, url: `https://www.youtube.com/channel/${id}`, followers: entry.followers },
+    creator: { id, name: name || entry.name, url: `https://www.youtube.com/channel/${id}`, followers: entry.followers },
     works: list,
     note: notes.join('；'),
     peak,

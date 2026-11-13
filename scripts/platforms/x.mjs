@@ -44,7 +44,7 @@ export async function board(ctx) {
   const scope = country === 'global' ? null : country;
   // range=yesterday 是已结束的上一个 UTC 日（当天的还在滚动）；页面按曝光排序，涨粉排序下面自己做
   const url = `${XP}/accounts?range=yesterday${scope ? `&country=${scope}` : ''}`;
-  const d = rscFind(await ctx.http.text(url), '"rows":[{"account_id"', (o) => Array.isArray(o.rows) && o.date);
+  const d = rscFind(await ctx.http.text(url, { timeout: 60_000 }), '"rows":[{', (o) => Array.isArray(o.rows) && o.date && o.rows[0]?.handle);
   if (!d?.rows?.length) throw new Error('xpaiming 页面里没找到账号数据，页面结构可能变了');
   if (d.range !== 'yesterday' || !/^\d{4}-\d{2}-\d{2}$/.test(d.date) || d.stale === true) throw new Error(`xpaiming 返回的不是已结束的一天（range=${d.range} date=${d.date}）`);
   if (scope && d.countryFilter !== scope) throw new Error(`xpaiming 没有 ${scope} 榜（返回了 ${d.countryFilter}）`);

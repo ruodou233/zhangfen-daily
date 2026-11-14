@@ -2,7 +2,8 @@
 // 精选：从 <out>/*/data.json 全部日报和 <out>/copy/ 文案里挑出文案扎实的代表作，跨天按作品去重，
 // 全量重建 <out>/精选库.jsonl 和 <out>/精选库.md。阈值改了重跑即可；run.mjs 跑完也会调用一次。
 // 上榜本身就是入选理由：过门槛（时长 / 字数 / 非机构号 / 非敏感 / 有有效文案）的代表作都收，
-// 〔峰值〕、爆款系数、涨粉前几只作标签和排序依据，每天每平台每领域留前几条。
+// 〔峰值〕、爆款系数、涨粉前几只作标签和排序依据，每天每平台每专精留前几条；专精关注账号的代表作标〔关注〕，排在同专精榜单作者之后。
+// 旧 data.json 里的 vertical（领域）当作专精名读。
 // <out>/精选排除.txt：人工排除名单，每行一个作品 ID 或「平台:作者ID」，# 开头是注释。
 // node scripts/curate.mjs --out <dir> [--min-video-sec 60] [--min-speech 300] [--min-note 150] [--min-tweet 140]
 //                         [--burst 3] [--top-rank 3] [--max-per-day 4]
@@ -19,7 +20,7 @@ export const DEFAULTS = {
   minTweet: 140, // 纯文字推文有效字数
   burst: 3, // 爆款系数达到多少打「爆款」标签
   topRank: 3, // 涨粉排名前几打「涨粉前几」标签
-  maxPerDay: 4, // 同一天、同一平台、同一领域最多留几条
+  maxPerDay: 4, // 同一天、同一平台、同一专精最多留几条
 };
 
 const HOT = '\n## 热评\n';
@@ -83,13 +84,20 @@ export function curate(out, overrides = {}) {
   const excluded = new Set();
   const days = fs.readdirSync(out).filter((d) => /^\d{4}-\d{2}-\d{2}$/.test(d) && fs.existsSync(path.join(out, d, 'data.json'))).sort();
 
-  // 同一天同一作品可能出现在全站榜和领域榜：留排名最好的一条，领域取并集
+  // 同一天同一作品可能出现在全站榜、专精榜和关注账号里：留排名最好的一条，专精取并集
   const byDayWork = new Map();
   for (const day of days) {
     const data = JSON.parse(fs.readFileSync(path.join(out, day, 'data.json'), 'utf8'));
-    for (const b of data.platforms ?? []) {
-      for (const e of b.entries ?? []) {
+    // 关注账号当作专精里一个没有排名的「榜」，和榜单作者走同一套
+    const followed = (data.focus ?? []).flatMap((f) => (f.accounts ?? []).map((x) => ({ ...x, name: x.input?.name, follow: true })));
+    const sources = [
+      ...(data.platforms ?? []).map((b) => ({ b, focus: b.focus ?? b.vertical ?? null, entries: b.entries ?? [] })),
+      ...followed.map((x) => ({ b: { name: x.platform, label: x.label }, focus: x.focus, entries: [x] })),
+    ];
+    for (const { b, focus, entries } of sources) {
+      for (const e of entries) {
         if (!e.works?.length || isOrg(e.creator, e.name)) continue;
+        const rank = e.follow ? Infinity : e.rank;
         const banned = e.creator?.id != null && excludes.has(`${b.name}:${e.creator.id}`);
         const likes = e.works.map((w) => w.metrics?.likes).filter((x) => x != null);
         const med = likes.length >= 3 ? median(likes) : null;
@@ -101,22 +109,22 @@ export function curate(out, overrides = {}) {
           if (banned || excludes.has(String(w.id))) { excluded.add(`${b.name}|${w.id}`); continue; }
           const burst = med && w.metrics?.likes != null ? +(w.metrics.likes / med).toFixed(1) : null;
           const tags = [
+            e.follow && '〔关注〕',
             w.pick === 'peak' && '〔峰值〕',
             burst != null && burst >= t.burst && `爆款系数 ${burst}`,
-            e.rank <= t.topRank && `涨粉第 ${e.rank}`,
+            rank <= t.topRank && `涨粉第 ${rank}`,
           ].filter(Boolean);
           const key = `${day}|${b.name}|${w.id}`;
           const old = byDayWork.get(key);
-          const vertical = b.vertical ?? null;
           if (old) {
-            if (vertical && !old.verticals.includes(vertical)) old.verticals.push(vertical);
-            old.site ||= !vertical;
-            if (e.rank >= old.rank) continue;
+            if (focus && !old.focus.includes(focus)) old.focus.push(focus);
+            old.site ||= !focus;
+            if (rank >= (old.rank ?? Infinity)) continue;
           }
           byDayWork.set(key, {
-            date: day, platform: b.name, label: b.label, verticals: old?.verticals ?? (vertical ? [vertical] : []), site: old?.site || !vertical,
-            board: { period: b.board?.period ?? null, date: b.board?.date ?? null, category: b.category ?? null },
-            rank: e.rank, gain: e.gain ?? null, followers: e.followers ?? e.creator?.followers ?? null,
+            date: day, platform: b.name, label: b.label, focus: old?.focus ?? (focus ? [focus] : []), site: old?.site || !focus,
+            follow: !!e.follow, board: { period: b.board?.period ?? null, date: b.board?.date ?? null, category: b.category ?? null },
+            rank: e.follow ? null : e.rank, gain: e.gain ?? null, followers: e.followers ?? e.creator?.followers ?? null,
             author: { name: e.creator?.name ?? e.name, id: e.creator?.id ?? null, url: e.creator?.url ?? null },
             work: { id: w.id, url: w.url, title: w.title || flat(w.desc, 40), type: w.type, published_at: w.published_at, duration: g.duration, metrics: w.metrics ?? {} },
             peak: w.pick === 'peak', burst, tags, language: w.copy.language ?? null,
@@ -134,12 +142,12 @@ export function curate(out, overrides = {}) {
     const id = `${x.platform}|${x.work.id}`;
     if (seen.has(id)) continue;
     seen.add(id);
-    const g = `${x.date}|${x.platform}|${x.site ? '' : x.verticals[0]}`;
+    const g = `${x.date}|${x.platform}|${x.site ? '' : x.focus[0]}`;
     groups.set(g, [...(groups.get(g) ?? []), x]);
   }
   const unknown = (x) => x.work.type === 'video' && x.work.duration == null;
   const items = [...groups.values()].flatMap((xs) => xs
-    .sort((a, b) => unknown(a) - unknown(b) || (b.gain ?? 0) - (a.gain ?? 0) || b.peak - a.peak || (b.burst ?? 0) - (a.burst ?? 0))
+    .sort((a, b) => a.follow - b.follow || unknown(a) - unknown(b) || (b.gain ?? 0) - (a.gain ?? 0) || b.peak - a.peak || (b.burst ?? 0) - (a.burst ?? 0))
     .slice(0, t.maxPerDay));
   items.sort((a, b) => b.date.localeCompare(a.date) || (b.gain ?? 0) - (a.gain ?? 0));
 
@@ -157,8 +165,9 @@ export const num = (n) => {
   if (a >= 1e4) return `${+(n / 1e4).toFixed(1)}万`;
   return String(n);
 };
-// 计入全站名额的只标平台；只从领域榜入选的才标「平台 · 领域」（verticals 字段照旧保留全部）
-const place = (x) => (x.site ? x.label : [x.label, ...x.verticals].join(' · '));
+// 计入全站名额的只标平台；只从专精入选的才标「平台 · 专精」（focus 字段照旧保留全部）
+const place = (x) => (x.site ? x.label : [x.label, ...x.focus].join(' · '));
+const growth = (x) => (x.follow ? `总粉 ${num(x.followers)}` : `+${num(x.gain)} / ${num(x.followers)}`);
 export const clock = (s) => (s == null ? '—' : `${Math.floor(s / 60)}:${String(Math.round(s % 60)).padStart(2, '0')}`);
 const esc = (s) => String(s ?? '').replace(/[[\]|]/g, '\\$&');
 
@@ -167,7 +176,7 @@ export function itemLine(x, linkBase = '') {
   const m = x.work.metrics;
   const where = place(x);
   const stats = `播放 ${num(m.plays)} / 赞 ${num(m.likes)} / 评 ${num(m.comments)} / 藏 ${num(m.collects)} / 转 ${num(m.shares)}`;
-  return `〔${where}〕${esc(x.author.name)}（+${num(x.gain)} / ${num(x.followers)}）[${esc(x.work.title) || '（无标题）'}](${x.work.url})`
+  return `〔${where}〕${esc(x.author.name)}（${growth(x)}）[${esc(x.work.title) || '（无标题）'}](${x.work.url})`
     + ` · ${x.work.type === 'note' ? '图文' : `时长 ${clock(x.work.duration)}`} · ${stats}`
     + `${x.burst != null ? ` · 爆款系数 ${x.burst}` : ''}${x.tags.length ? ` · ${x.tags.join('、')}` : ''}${x.language ? ` · 语言 ${x.language}` : ''}`
     + ` · [文案 ${x.chars} 字](${linkBase}${x.copy_file})`;
@@ -177,7 +186,7 @@ function libraryMarkdown(items, t) {
   const lines = [
     '# 精选库', '',
     `门槛：视频 ≥ ${t.minVideoSec} 秒且口播 / 字幕 ≥ ${t.minSpeech} 字；图文正文 ≥ ${t.minNote} 字；推文 ≥ ${t.minTweet} 字；机构号、平台标为敏感的不收。`
-    + `标签：〔峰值〕、爆款系数 ≥ ${t.burst}（点赞 / 作者窗口内作品点赞中位数）、涨粉前 ${t.topRank}。每天每平台每领域按 涨粉 → 峰值 → 爆款系数 留前 ${t.maxPerDay} 条。`,
+    + `标签：〔峰值〕、爆款系数 ≥ ${t.burst}（点赞 / 作者窗口内作品点赞中位数）、涨粉前 ${t.topRank}、〔关注〕（专精里的关注账号）。每天每平台每专精按 涨粉 → 峰值 → 爆款系数 留前 ${t.maxPerDay} 条，关注账号排在榜单作者之后。`,
     '', `共 ${items.length} 条。`, '',
   ];
   let day = null;
@@ -189,7 +198,7 @@ function libraryMarkdown(items, t) {
     const w = x.work;
     lines.push(
       `### ${place(x)} · ${esc(x.author.name)}`, '',
-      `- 作者：${x.author.url ? `[${esc(x.author.name)}](${x.author.url})` : esc(x.author.name)}，涨粉 +${num(x.gain)} / 总粉 ${num(x.followers)}（${x.board.period ?? '榜单'} 第 ${x.rank}）`,
+      `- 作者：${x.author.url ? `[${esc(x.author.name)}](${x.author.url})` : esc(x.author.name)}，${x.follow ? `总粉 ${num(x.followers)}（关注账号）` : `涨粉 +${num(x.gain)} / 总粉 ${num(x.followers)}（${x.board.period ?? '榜单'} 第 ${x.rank}）`}`,
       `- 作品：[${esc(w.title) || '（无标题）'}](${w.url}) · 发布 ${String(w.published_at ?? '').slice(0, 16).replace('T', ' ')} · ${w.type === 'note' ? '图文' : `时长 ${clock(w.duration)}`}`,
       `- 数据：播放 ${num(w.metrics.plays)} / 赞 ${num(w.metrics.likes)} / 评 ${num(w.metrics.comments)} / 藏 ${num(w.metrics.collects)} / 转 ${num(w.metrics.shares)}${x.burst != null ? ` · 爆款系数 ${x.burst}` : ''}`,
       `- 标签：${x.tags.join('、') || '—'}${x.language ? ` · 转写语言 ${x.language}` : ''}`,

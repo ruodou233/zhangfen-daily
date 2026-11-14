@@ -141,7 +141,7 @@ async function searchUser(ctx, fg, entry) {
 }
 
 export async function works(ctx, entry, board) {
-  // 指定账号模式（watch.mjs）：entry.ref.secUid 来自主页链接，不走飞瓜
+  // 关注账号（专精里的 accounts）：entry.ref.secUid 来自主页链接，不走飞瓜
   if (entry.ref?.secUid) return userWorks(ctx, entry, board);
   const fg = await feiguaProfile(ctx, entry.ref.detail);
   const { secUid, followers } = await resolveSecUid(ctx, fg, entry);

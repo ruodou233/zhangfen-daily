@@ -33,8 +33,8 @@ function boardLine(p) {
   return `${p.label}${board}${p.status === 'ok' ? '' : `：${short(p.error, 40)}`}`;
 }
 
-// 领域里的小节用「平台 · 分类」作标题，全站榜照旧只写平台
-const title = (p, level) => `${'#'.repeat(level)} ${p.label}${p.vertical ? ` · ${p.category}` : ''}${p.board ? ` · ${p.board.period} · ${p.board.date}` : ''}`;
+// 专精里的小节用「平台 · 分类」作标题，全站榜照旧只写平台
+const title = (p, level) => `${'#'.repeat(level)} ${p.label}${p.focus ? ` · ${p.category}` : ''}${p.board ? ` · ${p.board.period} · ${p.board.date}` : ''}`;
 
 function workCell(w) {
   const m = w.metrics ?? {};
@@ -83,6 +83,27 @@ function platformSection(p, shown, level = 2) {
   return out;
 }
 
+// 专精的关注账号：平台、作者、总粉、窗口作品数、代表作、文案
+function accountSection(accounts) {
+  const out = ['### 关注账号', '', '| 平台 | 作者 | 总粉 | 窗口作品数 | 代表作 | 文案 |', '|---|---|---|---|---|---|'];
+  for (const x of accounts) {
+    const name = x.creator?.name || x.input?.name || '（未命名）';
+    const who = x.creator?.url || x.input?.url ? `[${linkText(name)}](${x.creator?.url || x.input.url})` : cell(name);
+    const head = `| ${cell(x.label)} | ${who} | ${num(x.creator?.followers)} |`;
+    if (x.skipped) out.push(`${head} — | 未采集：${cell(x.skipped)} | |`);
+    else if (x.same_as) out.push(`${head} ${x.works?.length ?? '—'} | 同${cell(x.same_as)}，不重复列 | |`);
+    else if (x.error) out.push(`${head} — | ${reason(x.error, 60)} | |`);
+    else {
+      const reps = x.works.filter((w) => w.representative).sort(peakFirst);
+      out.push(`${head} ${x.works.length} | ${reps.map(workCell).join('<br>') || '窗口内无作品'} | ${reps.map(copyCell).join('<br>')} |`);
+    }
+  }
+  out.push('');
+  const notes = accounts.filter((x) => x.note && !x.same_as).map((x) => `- ${cell(x.creator?.name || x.input?.name)}：${cell(x.note)}`);
+  if (notes.length) out.push(...notes, '');
+  return out;
+}
+
 // data.json 先写（精选要读它），report.md 等精选算完再写
 export function writeData(dir, data) {
   fs.mkdirSync(dir, { recursive: true });
@@ -93,18 +114,26 @@ export function writeData(dir, data) {
 
 export function writeReport(dir, data, picks = []) {
   fs.mkdirSync(dir, { recursive: true });
-  const site = data.platforms.filter((p) => !p.vertical);
-  const lines = [`# 涨粉榜日报 ${data.date}`, '', site.map(boardLine).join(' ｜ ')];
-  if (data.verticals?.length) lines.push('', `领域：${data.verticals.map((v) => v.name).join('、')}`);
+  const site = data.platforms.filter((p) => !p.focus);
+  const lines = [`# 涨粉榜日报 ${data.date}`, ''];
+  if (site.length) lines.push(site.map(boardLine).join(' ｜ '), '');
+  if (data.focus?.length) lines.push(`专精：${data.focus.map((f) => f.name).join('、')}${site.length ? '' : '（本次没跑全站榜）'}`, '');
+  lines.pop();
   if (data.budget_exhausted) lines.push('', `整轮预算 ${data.opts.budget_min} 分钟用完，之后的作者或文案已跳过（见下表）。`);
   lines.push('');
   // 有前一天的日报才标「新进 / 连续 N 天」
   for (const p of site) lines.push(...platformSection(p, !!data.prev_date));
-  for (const v of data.verticals ?? []) {
-    lines.push(`## 领域 · ${v.name}`, '');
-    const boards = data.platforms.filter((p) => p.vertical === v.name);
-    if (v.error || !boards.length) lines.push(v.error ?? '这个领域的榜单都不在本次运行的平台里', '');
+  for (const f of data.focus ?? []) {
+    lines.push(`## 专精 · ${f.name}`, '');
+    const all = data.platforms.filter((p) => p.focus === f.name);
+    const off = all.filter((p) => p.status === 'skipped' && / 不在 --platforms 里$/.test(p.error ?? ''));
+    const boards = all.filter((p) => !off.includes(p));
+    if (f.error) lines.push(f.error, '');
+    else if (!all.length && !f.accounts.length) lines.push('这个专精文件里没有分类榜，也没有关注账号', '');
+    if (off.length) lines.push(`本次没跑（平台不在 --platforms 里）：${off.map((p) => `${p.name}:${p.category}`).join('、')}`, '');
+    if (f.pack) lines.push(`竞对数据包：[${path.basename(f.pack)}](${path.basename(f.pack)})`, '');
     for (const p of boards) lines.push(...platformSection(p, !!data.prev_date, 3));
+    if (f.accounts.length) lines.push(...accountSection(f.accounts));
   }
   lines.push(`## 今日精选（${picks.length} 条）`, '');
   if (data.curate_error) lines.push(`精选没算出来：${data.curate_error}`, '');

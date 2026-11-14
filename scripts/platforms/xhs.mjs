@@ -276,7 +276,7 @@ export async function parseUrl(ctx, url) {
 }
 
 export async function works(ctx, entry, board) {
-  // 指定账号模式（watch.mjs）：主页链接里已有 user_id，不用搜索确认身份
+  // 关注账号（专精里的 accounts）：主页链接里已有 user_id，不用搜索确认身份
   if (entry.ref?.userId) {
     const profile = await loadProfile(ctx, entry.ref.userId);
     return listWorks(ctx, entry, board, { id: entry.ref.userId, name: profile.name, signals: ['主页链接'] }, profile);

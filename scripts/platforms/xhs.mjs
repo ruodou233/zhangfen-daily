@@ -14,7 +14,9 @@ const SEARCH_API = /\/api\/sns\/web\/v\d\/search\/(onebox|usersearch|notes)/;
 const COMMENT_API = /\/api\/sns\/web\/v\d\/comment\/page/;
 const RISK = /IP存在风险|安全验证|访问频繁|账号异常|安全限制|captcha/i;
 
-const rankUrl = (ymd) => `${QG}/rank/fans/1/1/${ymd}/0.html`;
+// 千瓜榜单分类（URL 最后一段）；默认 0 = 全部。--board xhs:教育 之类按名字取
+export const CATEGORIES = { 全部: 0, 教育: 78, 母婴育儿: 93, 情感两性: 89, 生活经验: 106, 医疗养生: 85, 科技数码: 96 };
+const rankUrl = (ymd, cat = 0) => `${QG}/rank/fans/1/1/${ymd}/${cat}.html`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, Math.max(0, ms)));
 const cstISO = (ms) => new Date(ms + CST).toISOString().replace(/\.\d+Z$/, '+08:00');
 const unescape = (s) =>
@@ -56,23 +58,26 @@ function rows(html) {
   return out;
 }
 
-export async function board(ctx) {
+export async function board(ctx, { category } = {}) {
+  const cat = category == null ? 0 : CATEGORIES[category];
+  if (cat == null) throw new Error(`千瓜没有「${category}」这个分类（可选：${Object.keys(CATEGORIES).join('、')}）`);
+  const rankUrl_ = (ymd) => rankUrl(ymd, cat);
   // 先猜昨天（北京时间）；期次列表的第一项不是它就改取那一期
   let ymd = cstISO(Date.now() - DAY).slice(0, 10).replaceAll('-', '');
-  let html = await ctx.http.text(rankUrl(ymd));
+  let html = await ctx.http.text(rankUrl_(ymd));
   const latest = periods(html)[0];
   if (!latest) throw new Error('千瓜页面里没找到期次列表，榜期获取失败');
   if (latest !== ymd) {
     ctx.log(`千瓜 ${ymd} 期还没发布，改取最新一期 ${latest}`);
     ymd = latest;
-    html = await ctx.http.text(rankUrl(ymd));
+    html = await ctx.http.text(rankUrl_(ymd));
   }
   const entries = rows(html);
   if (!entries.length) throw new Error(`千瓜 ${ymd} 期榜单是空表`);
   return {
     date: `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6)}`,
-    period: '日榜',
-    url: rankUrl(ymd),
+    period: cat ? `日榜·${category}` : '日榜',
+    url: rankUrl_(ymd),
     entries: entries.slice(0, ctx.opts.top),
   };
 }
@@ -213,7 +218,7 @@ function remember(ctx, entry, user) {
 const PROFILE_JS = `(()=>{const un=x=>x&&(x._rawValue??x._value??x);const u=window.__INITIAL_STATE__?.user;const d=un(u?.userPageData);
   if(!d?.basicInfo)return null;const notes=un(u.notes);const first=(Array.isArray(notes)&&Array.isArray(notes[0])?notes[0]:[]).map(un);
   if(!first.length&&d.posted!==0)return null;
-  return {name:d.basicInfo.nickname,avatar:d.basicInfo.images,fans:(d.interactions||[]).find(i=>i.type==='fans')?.count,
+  return {name:d.basicInfo.nickname,avatar:d.basicInfo.images,fans:(d.interactions||[]).find(i=>i.type==='fans')?.count,verify:d.verifyInfo?.redOfficialVerifyType??0,
     notes:first.map(n=>({id:n.noteCard?.noteId||n.id,token:n.xsecToken||n.noteCard?.xsecToken,
       title:n.noteCard?.displayTitle,type:n.noteCard?.type,time:n.noteCard?.time,likes:n.noteCard?.interactInfo?.likedCount}))}})()`;
 
@@ -239,6 +244,7 @@ async function fillDetail(ctx, work) {
     work.metrics = { plays: null, likes: num(d.i?.likedCount), comments: num(d.i?.commentCount), collects: num(d.i?.collectedCount), shares: num(d.i?.shareCount) };
     work.desc = tidy(d.desc);
     work.media = d.video && { url: d.video.url, duration: d.video.duration, headers: { Referer: `${XHS}/` } };
+    work.duration = work.type === 'video' ? d.video?.duration ?? null : null;
     // 评论接口先有一次 CORS 预检（没有响应体），等带 comments 的那次
     const res = await page.waitFor(() => page.responses.find((r) => r.body?.data?.comments), 6000).catch(() => null);
     hot.set(work.id, (res?.body.data.comments ?? []).map((c) => ({ text: c.content ?? '', likes: num(c.like_count) ?? 0 }))
@@ -257,7 +263,24 @@ async function loadProfile(ctx, id) {
   return value;
 }
 
+// 主页链接 → user_id（xiaohongshu.com/user/profile/<24 位 id>）；xhslink.com 短链跟随跳转
+export async function parseUrl(ctx, url) {
+  let u = url.trim();
+  if (/xhslink\.com/.test(u)) {
+    const res = await ctx.http.request(u, { redirect: 'manual' });
+    u = res.headers.get('location') || u;
+  }
+  const id = u.match(/\/user\/profile\/([0-9a-f]{24})/i)?.[1];
+  if (!id) throw new Error('认不出小红书主页链接（要 xiaohongshu.com/user/profile/ 开头的主页地址）');
+  return { userId: id };
+}
+
 export async function works(ctx, entry, board) {
+  // 指定账号模式（watch.mjs）：主页链接里已有 user_id，不用搜索确认身份
+  if (entry.ref?.userId) {
+    const profile = await loadProfile(ctx, entry.ref.userId);
+    return listWorks(ctx, entry, board, { id: entry.ref.userId, name: profile.name, signals: ['主页链接'] }, profile);
+  }
   let user, profile, via = '搜索';
   const cache = readCache(ctx);
   const cached = cache[entry.ref?.avatar] ?? Object.values(cache).find((c) => norm(c.qg_name) === norm(entry.name));
@@ -274,7 +297,10 @@ export async function works(ctx, entry, board) {
   }
   ctx.log(`${entry.name} → ${user.name}（${user.id}，${via}：${user.signals.join('+')}吻合）`);
   remember(ctx, entry, user);
+  return listWorks(ctx, entry, board, user, profile);
+}
 
+async function listWorks(ctx, entry, board, user, profile) {
   const start = Date.parse(`${board.date}T00:00:00+08:00`) - ctx.opts.window * DAY;
   const end = Date.parse(`${board.date}T00:00:00+08:00`) + DAY;
   const list = profile.notes
@@ -288,34 +314,35 @@ export async function works(ctx, entry, board) {
       title: n.title ?? '',
       type: n.type === 'video' ? 'video' : 'note',
       published_at: cstISO(n.time),
+      duration: null, // 主页卡片不带时长，开详情时补（video.capa.duration）
       metrics: { plays: null, likes: num(n.likes), comments: null, collects: null, shares: null },
       desc: null,
       media: null,
     }));
 
-  const notes = [];
-  // 只为点赞最高、会被选作代表作的几条开详情；其余保留卡片上的点赞数和发布时间
-  const top = [...list].sort((a, b) => (b.metrics.likes ?? -1) - (a.metrics.likes ?? -1)).slice(0, ctx.opts.copy ?? 2);
-  if (list.length > top.length) ctx.log(`${entry.name}：窗口内 ${list.length} 条（主页首屏 ${profile.notes.length} 条），只为点赞前 ${top.length} 条取详情`);
-  for (const w of top) {
-    if (Date.now() > ctx.deadline) { notes.push('预算用完，详情没取完'); break; }
+  ctx.log(`${entry.name}：窗口内 ${list.length} 条（主页首屏 ${profile.notes.length} 条）`);
+  return {
+    // 主页 verifyInfo.redOfficialVerifyType：2 蓝 V（企业、机构、媒体），1 红 V（个人认证），没有为 0
+    creator: { id: user.id, name: profile.name ?? user.name, url: `${XHS}/user/profile/${user.id}`, followers: num(profile.fans) ?? user.fans ?? null, org: profile.verify === 2 },
+    works: list,
+  };
+}
+
+// run.mjs 选代表作前调用：为点赞前几条开详情，补时长、正文、互动数据和视频地址。出错只记在作品上
+export async function enrich(ctx, works) {
+  for (const w of works) {
+    if (w.desc != null || Date.now() > ctx.deadline) continue;
     try {
       await fillDetail(ctx, w);
     } catch (e) {
       if (blocked) throw e;
-      notes.push(`${w.id} 详情取不到（${e.message}）`);
+      ctx.log(`  ${w.id} 详情取不到（${e.message}）`);
     }
   }
-
-  return {
-    creator: { id: user.id, name: profile.name ?? user.name, url: `${XHS}/user/profile/${user.id}`, followers: num(profile.fans) ?? user.fans ?? null },
-    works: list,
-    note: notes.join('；'),
-  };
 }
 
 export async function copy(ctx, work) {
-  if (work.desc == null) await fillDetail(ctx, work); // works() 里没开过详情的，这时补开
+  if (work.desc == null) await fillDetail(ctx, work); // 选代表作前没开过详情的，这时补开
   const text = [work.title, work.desc].map((s) => s?.trim()).filter(Boolean).join('\n\n');
   const comments = hot.get(work.id) ?? [];
   if (work.type !== 'video') return { source: 'text', text, comments };

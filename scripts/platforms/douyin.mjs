@@ -9,7 +9,9 @@ const FG = 'https://dy3.feigua.cn';
 const DAY = 86_400_000;
 const CST = 8 * 3_600_000;
 
-const rankUrl = (ymd) => `${FG}/rank/fans/0/day/${ymd}.html`;
+// 飞瓜榜单分类（URL 里的数字）；默认 0 = 全站。--board douyin:教育校园 之类按名字取
+export const CATEGORIES = { 全部: 0, 亲子: 3, 教育校园: 13, 母婴: 21, 情感: 11, 职场: 34, 生活记录: 26, 医疗健康: 10, 科技: 30, 科普: 31, 财经: 37 };
+const rankUrl = (ymd, cat = 0) => `${FG}/rank/fans/${cat}/day/${ymd}.html`;
 const unescape = (s) =>
   s.replace(/&#x([0-9a-f]+);/gi, (_, h) => String.fromCodePoint(parseInt(h, 16)))
     .replace(/&#(\d+);/g, (_, d) => String.fromCodePoint(+d))
@@ -27,19 +29,22 @@ const cstISO = (ms) => new Date(ms + CST).toISOString().replace('Z', '+08:00');
 // 但页面的日期下拉 #dateSel 只列已发布的期次（第一项最新），真实那一期在列表里会带 class="active"。
 function periods(html) {
   const ul = html.match(/id="dateSel"[\s\S]*?<\/ul>/)?.[0] ?? '';
-  return [...ul.matchAll(/<li([^>]*)>\s*<a href="\/rank\/fans\/0\/day\/(\d{8})\.html"/g)]
+  return [...ul.matchAll(/<li([^>]*)>\s*<a href="\/rank\/fans\/\d+\/day\/(\d{8})\.html"/g)]
     .map(([, attr, ymd]) => ({ ymd, active: /active/.test(attr) }));
 }
 
-export async function board(ctx) {
+export async function board(ctx, { category } = {}) {
+  const cat = category == null ? 0 : CATEGORIES[category];
+  if (cat == null) throw new Error(`飞瓜没有「${category}」这个分类（可选：${Object.keys(CATEGORIES).join('、')}）`);
+  const rankUrl_ = (ymd) => rankUrl(ymd, cat);
   // 先猜昨天（北京时间）；没发布就跟着下拉列表的第一项走
   const guess = cstISO(Date.now() - DAY).slice(0, 10).replaceAll('-', '');
-  let html = await ctx.http.text(rankUrl(guess));
+  let html = await ctx.http.text(rankUrl_(guess));
   const latest = periods(html)[0]?.ymd;
   if (!latest) throw new Error('飞瓜榜单页里没找到期次列表，页面结构可能变了');
   if (latest !== guess) {
     ctx.log(`飞瓜 ${guess} 期还没发布，改取最新一期 ${latest}`);
-    html = await ctx.http.text(rankUrl(latest));
+    html = await ctx.http.text(rankUrl_(latest));
   }
   if (!periods(html).find((p) => p.active && p.ymd === latest)) throw new Error(`飞瓜 ${latest} 期页面没有标记为当前期，无法确认榜期`);
 
@@ -55,8 +60,8 @@ export async function board(ctx) {
   if (!entries.length) throw new Error(`飞瓜 ${latest} 期榜单没解析出条目`);
   return {
     date: `${latest.slice(0, 4)}-${latest.slice(4, 6)}-${latest.slice(6)}`,
-    period: '日榜',
-    url: rankUrl(latest),
+    period: cat ? `日榜·${category}` : '日榜',
+    url: rankUrl_(latest),
     entries: entries.slice(0, ctx.opts.top),
   };
 }
@@ -136,6 +141,8 @@ async function searchUser(ctx, fg, entry) {
 }
 
 export async function works(ctx, entry, board) {
+  // 指定账号模式（watch.mjs）：entry.ref.secUid 来自主页链接，不走飞瓜
+  if (entry.ref?.secUid) return userWorks(ctx, entry, board);
   const fg = await feiguaProfile(ctx, entry.ref.detail);
   const { secUid, followers } = await resolveSecUid(ctx, fg, entry);
 
@@ -172,12 +179,72 @@ export async function works(ctx, entry, board) {
   const earliest = Math.min(...list.filter((a) => !a.is_top).map((a) => a.create_time * 1000));
   ctx.log(`${entry.name}：主页取了 ${used} 页 ${list.length} 条，窗口内 ${inWindow.length} 条`);
   return {
-    creator: { id: fg.uid, name: own?.nickname || fg.nickname || entry.name, url, followers: followers ?? entry.followers },
+    creator: { id: fg.uid, name: own?.nickname || fg.nickname || entry.name, url, followers: followers ?? entry.followers, org: orgOf(own) },
     works: inWindow.map(toWork),
     note: more && earliest > start ? `主页只取了 ${used} 页，窗口内至少 ${inWindow.length} 条` : '',
     peak: peakDay(fg.fansInc, board, ctx.opts.window),
   };
 }
+
+// 主页链接 → sec_uid。短链 v.douyin.com/xxx 跟随跳转后再取
+export async function parseUrl(ctx, url) {
+  let u = url.trim();
+  if (/v\.douyin\.com|iesdouyin\.com\/share/.test(u)) {
+    const res = await ctx.http.request(u, { redirect: 'manual' });
+    u = res.headers.get('location') || u;
+  }
+  const secUid = u.match(/\/user\/([\w-]{20,})/)?.[1] ?? u.match(/sec_uid=([\w-]{20,})/)?.[1];
+  if (!secUid) throw new Error('认不出抖音主页链接（要 douyin.com/user/ 开头的主页地址，或主页分享出来的 v.douyin.com 短链）');
+  return { secUid };
+}
+
+// 指定账号：直接开主页取作品列表（和榜单路径同一套翻页逻辑），作者资料取自作品里的 author
+async function userWorks(ctx, entry, board) {
+  const { secUid } = entry.ref;
+  const url = `https://www.douyin.com/user/${secUid}`;
+  const end = Date.parse(`${board.date}T23:59:59.999+08:00`);
+  const start = end + 1 - (ctx.opts.window + 1) * DAY;
+  const page = await (await ctx.browser()).open(url, { capture: [POST], waitMs: 0 });
+  const list = [];
+  let more = false, used = 0;
+  try {
+    const posts = () => page.responses.filter((r) => r.body && typeof r.body === 'object');
+    for (let i = 0; i < 3; i++) {
+      if (i && !posts()[i]) await page.eval('window.scrollTo(0, document.documentElement.scrollHeight)').catch(() => {});
+      const res = await page.waitFor(() => posts()[i], i ? 10_000 : 20_000).catch(() => null);
+      if (!i && !res) throw new Error('主页没有返回作品列表（可能是私密账号或出了验证码）');
+      if (!i && res.body.status_code !== 0) throw new Error(`作品接口返回 status_code=${res.body.status_code}`);
+      if (res?.body.status_code !== 0) break;
+      list.push(...(res.body.aweme_list ?? []));
+      used++;
+      more = !!res.body.has_more;
+      const oldest = Math.min(...list.filter((a) => !a.is_top).map((a) => a.create_time * 1000));
+      if (!res.body.has_more || oldest <= start) break;
+    }
+  } finally {
+    await page.close();
+  }
+  const own = list.find((a) => a.author?.sec_uid === secUid)?.author ?? list[0]?.author;
+  // 作品里的 author 不带粉丝数，用直播的用户接口按 uid 补（免登录 HTTP，和 resolveSecUid 同一个接口）
+  let followers = own?.follower_count || null;
+  if (!followers && own?.uid) {
+    try {
+      const { data } = await ctx.http.json(`https://live.douyin.com/webcast/user/?aid=6383&target_uid=${own.uid}`);
+      followers = data?.follow_info?.follower_count ?? null;
+    } catch (e) { ctx.log(`${entry.name} 粉丝数取不到（${e.message}）`); }
+  }
+  const inWindow = list.filter((a) => a.create_time * 1000 >= start && a.create_time * 1000 <= end);
+  const earliest = Math.min(...list.filter((a) => !a.is_top).map((a) => a.create_time * 1000));
+  ctx.log(`${entry.name}：主页取了 ${used} 页 ${list.length} 条，窗口内 ${inWindow.length} 条`);
+  return {
+    creator: { id: own?.uid ? String(own.uid) : secUid, name: own?.nickname || entry.name, url, followers, org: orgOf(own) },
+    works: inWindow.map(toWork),
+    note: more && earliest > start ? `主页只取了 ${used} 页，窗口内至少 ${inWindow.length} 条` : '',
+  };
+}
+
+// 蓝 V（企业、机构、媒体、政务）的作品 author 带 enterprise_verify_reason；黄 V（个人认证）是 custom_verify，没认证两项都空
+const orgOf = (author) => (author ? !!author.enterprise_verify_reason : null);
 
 function toWork(a) {
   const st = a.statistics ?? {};
@@ -196,6 +263,8 @@ function toWork(a) {
     title: a.item_title || desc.split('\n')[0].slice(0, 60),
     type: isNote ? 'note' : 'video',
     published_at: cstISO(a.create_time * 1000),
+    duration: isNote ? null : Math.round(v.duration / 1000), // video.duration 是毫秒
+    ...(a.risk_infos?.warn ? { sensitive: true } : {}), // 平台加了风险提示（「请勿模仿」之类）
     // 网页端拿不到别人作品的播放数（恒为 0），记为 null
     metrics: { plays: st.play_count || null, likes: st.digg_count ?? null, comments: st.comment_count ?? null, collects: st.collect_count ?? null, shares: st.share_count ?? null },
     desc,

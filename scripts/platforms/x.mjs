@@ -118,6 +118,9 @@ function toWork(t, handle) {
     title: text.split('\n')[0].slice(0, 60),
     type: video ? 'video' : 'note',
     published_at: utcISO(Date.parse(l.created_at)),
+    duration: video ? (video.video_info?.duration_millis ?? 0) / 1000 || null : null,
+    // X 自己标的「可能含敏感内容」：只有带图片、视频或链接的推文才有这个字段，纯文字推文不带，这时不填
+    ...(l.possibly_sensitive != null ? { sensitive: l.possibly_sensitive } : {}),
     metrics: { plays: n(t.views?.count), likes: n(l.favorite_count), comments: n(l.reply_count), collects: n(l.bookmark_count), shares: n(l.retweet_count) },
     desc: text,
     media: mp4 ? { url: mp4.url, duration: (video.video_info.duration_millis ?? 0) / 1000 || null, lang: l.lang } : null,
@@ -205,8 +208,14 @@ export async function works(ctx, entry, board) {
   else if (earliest > end) notes.push(`主页翻了 ${used} 页还没到榜期（最早一条 ${utcISO(earliest).slice(0, 16)}），窗口内作品没取到`);
   else if (earliest > start) notes.push(`主页只取了 ${used} 页，窗口内至少 ${inWindow.length} 条`);
   return {
-    creator: { id: user.rest_id, name: user.core?.name ?? user.legacy?.name ?? entry.name, url: `https://x.com/${handle}`, followers: user.relationship_counts?.followers ?? user.legacy?.followers_count ?? entry.followers },
-    works: inWindow.map((t) => toWork(t, handle)),
+    // 认证类型：金标 Business（企业、机构、媒体）、灰标 Government 算机构；蓝标（个人订阅）和没认证的算个人
+    creator: {
+      id: user.rest_id, name: user.core?.name ?? user.legacy?.name ?? entry.name, url: `https://x.com/${handle}`,
+      followers: user.relationship_counts?.followers ?? user.legacy?.followers_count ?? entry.followers,
+      org: ['Business', 'Government'].includes(user.verification?.verified_type ?? user.legacy?.verified_type),
+    },
+    // 账号设了「发的媒体都标为敏感」（user.possibly_sensitive）时，所有作品都算敏感
+    works: inWindow.map((t) => toWork(t, handle)).map((w) => (user.possibly_sensitive ? { ...w, sensitive: true } : w)),
     note: notes.filter(Boolean).join('；'),
     ...(peak ? { peak } : {}),
   };

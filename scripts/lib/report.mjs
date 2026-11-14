@@ -1,6 +1,7 @@
 // 写 <out>/<date>/report.md 和 data.json
 import fs from 'node:fs';
 import path from 'node:path';
+import { itemLine } from '../curate.mjs';
 
 const SOURCE = { subtitle: '字幕', asr: '转写', text: '正文', 'text+asr': '正文+转写' };
 
@@ -32,6 +33,9 @@ function boardLine(p) {
   return `${p.label}${board}${p.status === 'ok' ? '' : `：${short(p.error, 40)}`}`;
 }
 
+// 领域里的小节用「平台 · 分类」作标题，全站榜照旧只写平台
+const title = (p, level) => `${'#'.repeat(level)} ${p.label}${p.vertical ? ` · ${p.category}` : ''}${p.board ? ` · ${p.board.period} · ${p.board.date}` : ''}`;
+
 function workCell(w) {
   const m = w.metrics ?? {};
   const stats = [`赞 ${num(m.likes)}`, m.plays != null && `播放 ${num(m.plays)}`].filter(Boolean).join(' / ');
@@ -44,8 +48,8 @@ function copyCell(w) {
   return reason(w.copy_error, 40);
 }
 
-function platformSection(p, shown) {
-  const out = [`## ${p.label}${p.board ? ` · ${p.board.period} · ${p.board.date}` : ''}`, ''];
+function platformSection(p, shown, level = 2) {
+  const out = [title(p, level), ''];
   if (p.board?.url) out.push(`榜单：${p.board.url}${p.board.unchanged ? `（榜单未更新，同 ${p.board.date.slice(5)} 期）` : ''}`, '');
   if (p.status !== 'ok' && !p.entries.length) {
     out.push(p.status === 'unavailable' ? p.error : reason(p.error, 200), '');
@@ -62,6 +66,10 @@ function platformSection(p, shown) {
   for (const e of p.entries) {
     const who = (e.creator?.url ? `[${linkText(e.creator.name || e.name)}](${e.creator.url})` : cell(e.name)) + streak(e, shown);
     const followers = num(e.creator?.followers ?? e.followers);
+    if (e.same_as) {
+      out.push(`| ${e.rank} | ${who} | ${gainCell(e)} | ${followers} | ${e.works?.length ?? '—'} | 同${cell(e.same_as)}，不重复列 | |`);
+      continue;
+    }
     if (e.error) {
       out.push(`| ${e.rank} | ${who} | ${gainCell(e)} | ${followers} | — | ${shared.has(e.error) ? '—' : reason(e.error, 60)} | |`);
       continue;
@@ -75,18 +83,34 @@ function platformSection(p, shown) {
   return out;
 }
 
-export function writeReport(dir, data) {
+// data.json 先写（精选要读它），report.md 等精选算完再写
+export function writeData(dir, data) {
   fs.mkdirSync(dir, { recursive: true });
-  const lines = [`# 涨粉榜日报 ${data.date}`, '', data.platforms.map(boardLine).join(' ｜ ')];
-  if (data.budget_exhausted) lines.push('', `整轮预算 ${data.opts.budget_min} 分钟用完，之后的作者或文案已跳过（见下表）。`);
-  lines.push('');
-  // 有前一天的日报才标「新进 / 连续 N 天」
-  for (const p of data.platforms) lines.push(...platformSection(p, !!data.prev_date));
-  lines.push('## 观察', '', '');
-  fs.writeFileSync(path.join(dir, 'report.md'), lines.join('\n'));
-
   // media 里是会过期的地址和请求头，不落盘
   const json = JSON.stringify(data, (k, v) => (k === 'media' ? undefined : v), 2);
   fs.writeFileSync(path.join(dir, 'data.json'), json + '\n');
+}
+
+export function writeReport(dir, data, picks = []) {
+  fs.mkdirSync(dir, { recursive: true });
+  const site = data.platforms.filter((p) => !p.vertical);
+  const lines = [`# 涨粉榜日报 ${data.date}`, '', site.map(boardLine).join(' ｜ ')];
+  if (data.verticals?.length) lines.push('', `领域：${data.verticals.map((v) => v.name).join('、')}`);
+  if (data.budget_exhausted) lines.push('', `整轮预算 ${data.opts.budget_min} 分钟用完，之后的作者或文案已跳过（见下表）。`);
+  lines.push('');
+  // 有前一天的日报才标「新进 / 连续 N 天」
+  for (const p of site) lines.push(...platformSection(p, !!data.prev_date));
+  for (const v of data.verticals ?? []) {
+    lines.push(`## 领域 · ${v.name}`, '');
+    const boards = data.platforms.filter((p) => p.vertical === v.name);
+    if (v.error || !boards.length) lines.push(v.error ?? '这个领域的榜单都不在本次运行的平台里', '');
+    for (const p of boards) lines.push(...platformSection(p, !!data.prev_date, 3));
+  }
+  lines.push(`## 今日精选（${picks.length} 条）`, '');
+  if (data.curate_error) lines.push(`精选没算出来：${data.curate_error}`, '');
+  else if (!picks.length) lines.push('今天没有新入选的作品（门槛和历史精选见 [精选库](../精选库.md)）。', '');
+  else lines.push(...picks.map((x, i) => `${i + 1}. ${itemLine(x, '../')}`), '', '全部历史精选见 [精选库](../精选库.md)。', '');
+  lines.push('## 观察', '', '');
+  fs.writeFileSync(path.join(dir, 'report.md'), lines.join('\n'));
   return path.join(dir, 'report.md');
 }

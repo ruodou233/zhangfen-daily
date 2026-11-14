@@ -32,7 +32,8 @@ export function createAsr({ python, log: baseLog = () => {} } = {}) {
   let queue = Promise.resolve();
   let pending = 0;
   // language：whisper 语言代码（'zh'、'en'、'en-US' 也行）；不给就自动识别。log 可按调用覆盖（并行时带上平台名）
-  return async function asr(input, { headers = {}, language, log = baseLog } = {}) {
+  // onLanguage(code)：转写完成时回报识别出的语言（指定了 language 时就是它）
+  return async function asr(input, { headers = {}, language, log = baseLog, onLanguage } = {}) {
     py ??= (() => { try { return findPython(python); } catch (e) { return e; } })();
     if (py instanceof Error) throw py;
     const args = [SCRIPT, input, ...(language ? ['--language', language] : [])];
@@ -41,13 +42,13 @@ export function createAsr({ python, log: baseLog = () => {} } = {}) {
       args.push('--headers', Object.entries(h).map(([k, v]) => `${k}: ${v}\r\n`).join(''));
     }
     if (pending++) log(`排队等转写（前面还有 ${pending - 1} 个）`);
-    const run = queue.then(() => transcribe(py, args, log)).finally(() => { pending--; });
+    const run = queue.then(() => transcribe(py, args, log, onLanguage)).finally(() => { pending--; });
     queue = run.catch(() => {});
     return run;
   };
 }
 
-function transcribe(py, args, log) {
+function transcribe(py, args, log, onLanguage) {
   return new Promise((resolve, reject) => {
     const t0 = Date.now();
     const child = spawn(py, args, { detached: true, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -76,8 +77,10 @@ function transcribe(py, args, log) {
     child.on('close', (code, signal) => {
       clearTimeout(timer);
       children.delete(child);
+      const lang = err.match(/^language (\S+)/m)?.[1];
+      if (code === 0 && lang) onLanguage?.(lang);
       if (code === 0) return resolve(out.trim()); // 空串表示没转出有效语音
-      const last = err.trim().split('\n').filter((l) => !/^duration /.test(l)).pop();
+      const last = err.trim().split('\n').filter((l) => !/^(duration|language) /.test(l)).pop();
       reject(new Error(signal ? `转写超时或被中止（${signal}）` : `转写失败：${last ?? `退出码 ${code}`}`));
     });
   });

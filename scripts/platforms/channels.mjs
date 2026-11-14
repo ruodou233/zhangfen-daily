@@ -26,16 +26,33 @@ const num = (s) => {
 
 // ---------- 榜单 ----------
 
-// /rank 会 301 到最新一期日榜。页面的日期下拉只列已发布的期次（第一项最新），当前期带 class="active"
-export async function board(ctx) {
-  const res = await ctx.http.request(`${YW}/rank`);
+// 友望行业排行榜的行业（URL 最后一段）；默认 0 = 全部
+export const CATEGORIES = {
+  全部: 0, 科技: 1, 互联网: 2, 科学科普: 3, 财经: 4, 教育: 5, 母婴育儿: 6, 职场管理: 7, 情感: 8, 旅游: 9, 萌宠: 10, 美食: 11, 生活: 12,
+  汽车: 13, 时尚: 14, 美妆: 15, 影视娱乐: 16, 游戏动漫: 17, 搞笑趣闻: 18, 健康: 19, 人文艺术: 20, 时事政务: 21, 地方资讯: 22, 运动: 23,
+  音乐: 24, 摄影: 25, 三农: 26,
+};
+// 认证角标（友望前端 authLevel：1 未认证、2 灰、3 黄 = 个人认证、4 蓝 = 企业 / 机构认证）
+const AUTH = { iconweirenzheng1: 'none', iconhuiserenzheng1: 'grey', iconhuangserenzheng1: 'yellow', iconlanserenzheng1: 'blue' };
+
+// /rank 会 301 到最新一期全部行业的日榜。页面的日期下拉只列已发布的期次（第一项最新），当前期带 class="active"
+export async function board(ctx, { category } = {}) {
+  const cat = category == null ? 0 : CATEGORIES[category];
+  if (cat == null) throw new Error(`友望没有「${category}」这个行业（可选：${Object.keys(CATEGORIES).join('、')}）`);
+  let res = await ctx.http.request(`${YW}/rank`);
   if (!res.ok) throw new Error(`友望榜单页 HTTP ${res.status}`);
-  const html = await res.text();
+  let html = await res.text();
   const ymd = res.url.match(/\/rank\/blogger\/1\/(\d{8})\/0\.html/)?.[1];
   const sel = html.match(/id="date-select"[\s\S]*?<\/ul>/)?.[0] ?? '';
   const dates = [...sel.matchAll(/<li class="([^"]*)" data-val="(\d{8})"/g)].map(([, cls, d]) => ({ d, active: /active/.test(cls) }));
   if (!ymd || !dates.length) throw new Error(`友望榜单页里没找到期次（落到 ${res.url}），页面结构可能变了`);
   if (dates[0].d !== ymd || !dates.find((x) => x.active && x.d === ymd)) throw new Error(`友望 /rank 跳到的 ${ymd} 期不是期次列表里的最新一期（${dates[0].d}），无法确认榜期`);
+  const url = `${YW}/rank/blogger/1/${ymd}/${cat}.html`;
+  if (cat) {
+    res = await ctx.http.request(url);
+    if (!res.ok) throw new Error(`友望「${category}」榜 HTTP ${res.status}`);
+    html = await res.text();
+  }
 
   const list = html.split('<ul class="lists">')[1]?.split('</ul>')[0] ?? '';
   const entries = [];
@@ -55,18 +72,19 @@ export async function board(ctx) {
         id, key,
         avatar: li.match(/<img src="([^"]+)"[^>]*class="head-img"/)?.[1] ?? null,
         tag: unescape(li.match(/profession-tag[\s\S]*?<span>([^<]*)<\/span>/)?.[1] ?? ''),
+        auth: AUTH[li.match(/iconfont (icon\w*renzheng1)/)?.[1]] ?? 'none',
         fans_estimate: fans ?? null,
         index: parseFloat(index) || null,
         day: { works: num(works), avg_likes: num(likes), avg_shares: num(shares), avg_collects: num(collects), avg_comments: num(comments) },
       },
     });
   }
-  if (!entries.length) throw new Error(`友望 ${ymd} 期日榜没解析出条目`);
+  if (!entries.length) throw new Error(`友望 ${ymd} 期${cat ? `「${category}」` : ''}日榜没解析出条目`);
   if (ctx.opts.top > entries.length) ctx.log(`友望公开页只列前 ${entries.length} 名（更多要登录），取 ${entries.length} 位`);
   return {
     date: `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6)}`,
-    period: '热度日榜（友望指数，非涨粉）',
-    url: `${YW}/rank/blogger/1/${ymd}/0.html`,
+    period: `热度日榜${cat ? `·${category}` : ''}（友望指数，非涨粉）`,
+    url,
     entries: entries.slice(0, ctx.opts.top),
   };
 }
@@ -94,6 +112,13 @@ async function api(ctx, path, params) {
   return j;
 }
 
+// 时长：数字（秒）或 'mm:ss' / 'hh:mm:ss'；认不出给 null
+function seconds(v) {
+  if (typeof v === 'number') return v || null;
+  const m = String(v ?? '').trim().match(/^(?:(\d+):)?(\d+):(\d{2})$/);
+  return m ? (+(m[1] ?? 0) * 60 + +m[2]) * 60 + +m[3] : null;
+}
+
 // 友望的时间有的是秒级时间戳，有的是 'YYYY-MM-DD HH:mm(:ss)' 北京时间
 function toMs(v) {
   if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
@@ -119,7 +144,11 @@ export async function works(ctx, entry, board) {
   const inWindow = list.filter((x) => x.ms >= start && x.ms <= end);
   ctx.log(`${entry.name}：友望作品列表 ${items.length}/${total} 条，窗口内 ${inWindow.length} 条`);
   return {
-    creator: { id: `youwant:${id}`, name: entry.name, url: `${YW}/home/#/blogger/detail/${id}/${key}`, followers: null },
+    // 认证看榜单上的角标：蓝 = 企业 / 机构，黄 = 个人认证，没有角标算个人；灰色和指定账号（没走榜单）认不出
+    creator: {
+      id: `youwant:${id}`, name: entry.name, url: `${YW}/home/#/blogger/detail/${id}/${key}`, followers: null,
+      org: { blue: true, yellow: false, none: false }[entry.ref.auth] ?? null,
+    },
     works: inWindow.map(({ v, ms }) => {
       const dateCode = v.DateCode ?? v.VideoDateCode;
       const desc = unescape(String(v.Description ?? '')).trim();
@@ -127,8 +156,10 @@ export async function works(ctx, entry, board) {
         id: String(v.VideoId),
         url: `${YW}/home/#/videoAnalysis/detail/${v.VideoId}/${v.VideoIdKey}/${dateCode}`,
         title: (v.Title || desc.split('\n')[0]).slice(0, 60),
-        type: 'video',
+        // 友望前端：MediaType 4 是视频（只有它显示时长 DurationDesc），其余是图文动态；以下两项未登录实测
+        type: v.MediaType == null || v.MediaType === 4 ? 'video' : 'note',
         published_at: cstISO(ms),
+        duration: v.MediaType === 4 || v.MediaType == null ? seconds(v.Duration ?? v.DurationDesc) : null,
         // 视频号的「推荐」即点赞，「喜欢」记作收藏
         metrics: {
           plays: null,

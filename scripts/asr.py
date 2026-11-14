@@ -114,6 +114,7 @@ def main():
     r = mlx_whisper.transcribe(audio, path_or_hf_repo=model, language=lang, temperature=(0.0, 0.4),
                                initial_prompt="以下是普通话的句子，使用简体中文和标点。" if lang == "zh" else None,
                                condition_on_previous_text=False)
+    print(f"language {r.get('language') or lang or 'unknown'}", file=sys.stderr, flush=True)
     lines = [t for t in (speech(seg, r.get("language") or lang) for seg in r["segments"]) if t]
     text = "\n".join(t for i, t in enumerate(lines) if i == 0 or t != lines[i - 1])  # 连续重复的同一句只留一次
     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", log)

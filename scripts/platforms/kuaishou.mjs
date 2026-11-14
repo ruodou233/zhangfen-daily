@@ -33,22 +33,28 @@ const num = (s) => {
   const m = String(s ?? '').replace(/[,+\s]/g, '').match(/^([\d.]+)(w|万|亿)?$/i);
   return m ? Math.round(parseFloat(m[1]) * ({ w: 1e4, 万: 1e4, 亿: 1e8 }[m[2]?.toLowerCase()] ?? 1)) : null;
 };
-const byLikes = (x, y) => (y.metrics?.likes ?? -1) - (x.metrics?.likes ?? -1) || (y.metrics?.plays ?? -1) - (x.metrics?.plays ?? -1);
 
-async function rank(ctx, r, cookie = '') {
+async function rank(ctx, r, cookie = '', type = '') {
   const res = await ctx.http.request(r.api, {
     method: 'POST',
     headers: { 'N-Token': r.token, 'Content-Type': 'application/json;charset=UTF-8', Origin: r.origin, Referer: `${r.origin}/`, Cookie: cookie },
-    body: JSON.stringify({ start: 1, size: 20, sort: r.sort, type: '' }),
+    body: JSON.stringify({ start: 1, size: 20, sort: r.sort, type }),
   });
   return res.json();
 }
 
-export async function board(ctx) {
+// 新榜快手涨粉榜的分类：请求体 type 直接传中文名（取自新榜前端），'' 为全部。新快免登录预览不认 type，所以分类榜必须登录
+export const CATEGORIES = Object.fromEntries(['搞笑', '情感', '美食', '娱乐', '游戏', '萌宠', '才艺', '健康', '运动', '旅游', '二次元',
+  '时尚', '母婴', '教育', '汽车', '家居', '科技', '文化', '生活'].map((x) => [x, x]));
+
+export async function board(ctx, { category } = {}) {
+  const type = category == null ? '' : CATEGORIES[category];
+  if (type == null) throw new Error(`新榜快手涨粉榜没有「${category}」这个分类（可选：${Object.keys(CATEGORIES).join('、')}）`);
   // 新榜主站的快手涨粉榜对注册用户免费，登录态从日常 Chrome 复制
   const cookie = await (await ctx.browser()).cookieHeader('gw.newrank.cn');
   let r = RANKS.day;
-  let res = await rank(ctx, r, cookie);
+  let res = await rank(ctx, r, cookie, type);
+  if (res.code === 401 && type) throw new Error(`快手「${category}」涨粉榜要新榜登录（在日常 Chrome 登录 newrank.cn 后重跑）`);
   if (res.code === 401) {
     ctx.log('新榜未登录，拿不到快手涨粉日榜；改用新快免登录预览（近 7 天涨粉前 3）。在日常 Chrome 登录 newrank.cn 后重跑即可取日榜');
     r = RANKS.preview;
@@ -61,7 +67,7 @@ export async function board(ctx) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('新榜快手涨粉榜没有 rank_date，无法确认榜期');
   return {
     date,
-    period: r.period,
+    period: type ? `${r.period}·${category}` : r.period,
     url: r.url,
     entries: list.slice(0, ctx.opts.top).map((x, i) => ({
       rank: i + 1, name: x.name, gain: num(x[r.sort]), followers: num(x.fan),
@@ -129,6 +135,10 @@ function uploadedAt(poster) {
   return t ? Date.parse(`${t[1]}-${t[2]}-${t[3]}T${t[4]}:${t[5]}:${t[6]}+08:00`) : null;
 }
 
+// 认证类型 verifiedStatus.type：按快手直播站前端的角标，1、4、5、7、8 是个人认证，6、10、11 是机构认证；
+// 9 在一处画个人、另一处算商家，和其他没见过的值一样给 null。没认证算个人
+const orgOf = (v) => (!v ? null : !v.verified ? false : [6, 10, 11].includes(v.type) ? true : [1, 4, 5, 7, 8].includes(v.type) ? false : null);
+
 function toWork(x) {
   const c = x.counts ?? {};
   const time = uploadedAt(x.poster);
@@ -139,6 +149,7 @@ function toWork(x) {
     title: '',
     type: isVideo ? 'video' : 'note',
     published_at: time ? cstISO(time) : null,
+    duration: null, // 主页列表不带时长；代表作开作品页时补
     metrics: { plays: num(c.displayView), likes: c.like ?? num(c.displayLike), comments: num(c.displayComment), collects: null, shares: null },
     desc: '',
     media: isVideo ? { url: x.playUrl, headers: { Referer: `${LIVE}/` } } : null,
@@ -176,21 +187,10 @@ export async function works(ctx, entry, board) {
   const inWindow = all.filter((w) => { const t = Date.parse(w.published_at); return t >= start && t <= end; });
   ctx.log(`${entry.name}：主页首屏本人作品 ${all.length} 条，窗口内 ${inWindow.length} 条`);
 
-  // 代表作（与 run.mjs 同样按点赞取前 --copy 条）补描述和精确时间；其余作品只有列表数据
-  for (const w of [...inWindow].sort(byLikes).slice(0, ctx.opts.copy)) {
-    if (w.type !== 'video') continue;
-    const d = await detail(ctx, w.id).catch((e) => { ctx.log(`  ${w.id} 作品页打开失败：${e.message}`); return null; });
-    if (!d) { ctx.log(`  ${w.id} 作品页里没有作品详情，只用列表数据`); continue; }
-    w.desc = (d.caption || '').replace(/@([^@(\s]+)\(O[0-9a-z]+\)/g, '@$1').trim(); // @昵称(O<eid>) 是 @ 提及的写法
-    w.title = w.desc.split('\n')[0].slice(0, 60);
-    if (d.timestamp) w.published_at = cstISO(d.timestamp);
-    if (d.duration) w.media.duration = d.duration / 1000;
-  }
-
   const oldest = Math.min(...times);
   const more = data.pcursor && data.pcursor !== 'no_more';
   return {
-    creator: { id: entry.ref.userId, name: user.name || entry.name, url, followers: entry.followers },
+    creator: { id: entry.ref.userId, name: user.name || entry.name, url, followers: entry.followers, org: orgOf(user.verifiedStatus) },
     works: inWindow,
     note: [
       times.length < all.length && `${all.length - times.length} 条作品认不出发布时间，未计入`,
@@ -199,7 +199,25 @@ export async function works(ctx, entry, board) {
   };
 }
 
+// 打开作品页补描述、精确发布时间和时长（图文作品没有详情可补）；每条只开一次
+const opened = new Set();
+async function fillDetail(ctx, w) {
+  opened.add(w.id);
+  const d = await detail(ctx, w.id).catch((e) => { ctx.log(`  ${w.id} 作品页打开失败：${e.message}`); return null; });
+  if (!d) { ctx.log(`  ${w.id} 作品页里没有作品详情，只用列表数据`); return; }
+  w.desc = (d.caption || '').replace(/@([^@(\s]+)\(O[0-9a-z]+\)/g, '@$1').trim(); // @昵称(O<eid>) 是 @ 提及的写法
+  w.title = w.desc.split('\n')[0].slice(0, 60);
+  if (d.timestamp) w.published_at = cstISO(d.timestamp);
+  if (d.duration) w.media.duration = w.duration = d.duration / 1000;
+}
+
+// run.mjs 选代表作前调用：为点赞前几条视频开作品页补时长
+export async function enrich(ctx, works) {
+  for (const w of works) if (w.type === 'video' && !opened.has(w.id) && Date.now() <= ctx.deadline) await fillDetail(ctx, w);
+}
+
 export async function copy(ctx, work) {
+  if (work.type === 'video' && !opened.has(work.id)) await fillDetail(ctx, work); // 选代表作前没开过作品页的，这时补开
   if (!work.media?.url) {
     if (!work.desc) throw new Error('快手图文作品网页端免登录拿不到文字说明');
     return { source: 'text', text: work.desc };

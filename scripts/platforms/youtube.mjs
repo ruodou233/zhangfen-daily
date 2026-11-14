@@ -2,6 +2,7 @@
 // → 频道 RSS 最近 15 条上传（含 Shorts）→ 窗口内作品逐条 yt-dlp -J 取播放 / 点赞 / 评论和字幕列表
 // → 文案 = 原语言字幕（人工 > 自动），没有字幕再下载音频转写；热评取「热门」排序前 20 条按赞数留 10 条。
 // ZF_YT_REGION：频道所属国家 / 地区代码（TW、HK、SG、MY、CN、US…），逗号分隔则合并几榜按涨粉重排；不设为全球榜。
+// 分类榜：board(ctx, { category: 'Science & Technology' })，按 viewstats 的频道分类（YouTube 官方分类号）筛。
 import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -84,17 +85,26 @@ async function vs(ctx, path, body, retry = true) {
   return JSON.parse(new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, buf)));
 }
 
+// viewstats 榜单的频道分类（就是 YouTube 官方的 categoryId）
+export const CATEGORIES = {
+  'Film & Animation': 1, 'Autos & Vehicles': 2, Music: 10, 'Pets & Animals': 15, Sports: 17, 'Travel & Events': 19, Gaming: 20,
+  'People & Blogs': 22, Comedy: 23, Entertainment: 24, 'News & Politics': 25, 'Howto & Style': 26, Education: 27,
+  'Science & Technology': 28, 'Nonprofits & Activism': 29,
+};
+
 // 筛选面板的三个开关（Show Made For Kids / Show Music Channels / Show Movies & Trailers）都关：只看创作者频道。
 // 直接打开 /top-list 时三个开关默认就是关的；站内导航链接则是全开
-const ranking = (ctx, country) => vs(ctx, '/rankings/channels', {
-  interval: 'yesterday', sortBy: 'subs', made_for_kids: false, show_music: false, category_id: null, country, show_movies: false,
+const ranking = (ctx, country, category_id = null) => vs(ctx, '/rankings/channels', {
+  interval: 'yesterday', sortBy: 'subs', made_for_kids: false, show_music: false, category_id, country, show_movies: false,
 });
 // 逐日数据：date 是快照所归的那天，subscriberCountDelta 是公开取整订阅数的日差。range 只接受 7 / 28 / 90 / 365
 const daily = (ctx, id, range) =>
   vs(ctx, `/channels/${id}/stats?range=${range}&groupBy=daily&sortOrder=ASC&withRevenue=false&withEvents=false&withBreakdown=false&withToday=false`);
 
-export async function board(ctx) {
-  const lists = await Promise.all((REGION.length ? REGION : [null]).map((c) => ranking(ctx, c)));
+export async function board(ctx, { category } = {}) {
+  const cat = category == null ? null : CATEGORIES[category];
+  if (category != null && cat == null) throw new Error(`viewstats 没有「${category}」这个分类（可选：${Object.keys(CATEGORIES).join('、')}）`);
+  const lists = await Promise.all((REGION.length ? REGION : [null]).map((c) => ranking(ctx, c, cat)));
   const seen = new Set();
   const rows = lists.flatMap((l) => l.data ?? [])
     .filter((r) => r.channel?.id && !seen.has(r.channel.id) && seen.add(r.channel.id))
@@ -115,7 +125,7 @@ export async function board(ctx) {
   return {
     date,
     tz: TZ,
-    period: REGION.length ? `日榜（${REGION.join('+')}）` : '日榜',
+    period: `日榜${cat ? `·${category}` : ''}${REGION.length ? `（${REGION.join('+')}）` : ''}`,
     url: `${VS}/top-list`,
     entries: rows.slice(0, ctx.opts.top).map((r, i) => ({
       rank: i + 1, name: r.channel.displayName, gain: r.subscriberCountDelta, followers: r.channel.subscriberCount,
@@ -149,11 +159,15 @@ function media(info) {
   const base = (k) => k.split('-')[0].toLowerCase();
   const manual = Object.keys(info.subtitles ?? {}).filter((k) => k !== 'live_chat');
   const auto = Object.keys(info.automatic_captions ?? {});
-  const orig = auto.find((k) => k.endsWith('-orig'));
-  const lang = info.language ?? orig?.replace(/-orig$/, '') ?? null;
+  // 有多条配音音轨的视频每条音轨各有一份 "-orig"（如 ar-orig、es-orig），要挑和视频语言一致的那份；
+  // 视频没标语言时只有一份 "-orig" 才认它
+  const origs = auto.filter((k) => k.endsWith('-orig'));
+  const lang = info.language ?? (origs.length === 1 ? origs[0].replace(/-orig$/, '') : null);
+  const orig = lang && origs.find((k) => base(k) === base(lang));
   const human = lang && (manual.find((k) => k === lang) ?? manual.find((k) => base(k) === base(lang)));
+  const autoLang = lang && (auto.includes(lang) ? lang : auto.includes(base(lang)) ? base(lang) : null);
   const pick = human ? ['subtitles', human]
-    : orig || auto.includes(lang) ? ['automatic_captions', orig ?? lang]
+    : orig || autoLang ? ['automatic_captions', orig ?? autoLang]
       : manual[0] ? ['subtitles', manual[0]] : null;
   const url = pick && info[pick[0]][pick[1]].find((f) => f.ext === 'json3')?.url;
   return { lang, sub: url ? { lang: pick[1], kind: pick[0] === 'subtitles' ? '人工' : '自动', url } : null };
@@ -252,6 +266,7 @@ export async function works(ctx, entry, board) {
       type: 'video',
       published_at: isoLocal(info?.timestamp ?? v.published),
       duration: info?.duration ?? null,
+      ...(info?.age_limit >= 18 ? { sensitive: true } : {}), // YouTube 的年龄限制
       metrics: {
         plays: info?.view_count ?? (v.plays ? +v.plays : null),
         likes: info?.like_count ?? (v.likes ? +v.likes : null),
@@ -286,7 +301,8 @@ export async function works(ctx, entry, board) {
   ctx.log(`${entry.name}：${src} ${feed.length} 条，窗口内 ${total} 条`);
 
   return {
-    creator: { id, name: name || entry.name, url: `https://www.youtube.com/channel/${id}`, followers: entry.followers },
+    // YouTube 的认证标记不区分个人和机构，org 给 null
+    creator: { id, name: name || entry.name, url: `https://www.youtube.com/channel/${id}`, followers: entry.followers, org: null },
     works: list,
     note: notes.join('；'),
     peak,

@@ -1,4 +1,5 @@
-// B站：zeroroku 滚动 7 日涨粉榜（另取逐日涨粉找峰值日）→ 投稿列表（WBI 签名）→ view 数据
+// B站：zeroroku 滚动 7 日涨粉榜（另取逐日涨粉找峰值日）；分区榜用飞瓜 B站版的分区涨粉日榜（免登录只给前 5 名，
+// UID 取自飞瓜详情页）→ 投稿列表（WBI 签名）→ view 数据
 // → AI 字幕，没有字幕就取音频转写；热评取热度排序前 10 条。
 // api.bilibili.com 的请求都放在无头浏览器的一个空白页里 fetch（真浏览器指纹 + 登录态）：
 // Node 直连投稿列表会间歇 412，打开空间页截请求又会被部分账号的主页重定向打断。
@@ -28,7 +29,54 @@ const shift = (date, n) => new Date((dayNo(date) + n) * DAY).toISOString().slice
 const dayStart = (date) => Date.parse(`${date}T00:00:00+08:00`) / 1000; // 北京时间零点，秒
 const cstISO = (sec) => new Date(sec * 1000 + 8 * 3_600_000).toISOString().replace(/\.\d+Z$/, '+08:00');
 
-export async function board(ctx) {
+// 飞瓜 B站版「UP主涨粉榜」的分区（URL 最后一段）。zeroroku 没有分区筛选，按分区取榜走飞瓜：
+// 免登录只列前 5 名，日期参数不管用、总是给最新一期
+const FG = 'https://bz.feigua.cn';
+export const CATEGORIES = {
+  动画: 1, 美妆: 3, 时尚: 4, 游戏: 6, 舞蹈: 7, 音乐: 8, 美食: 9, 动物: 10, 生活: 12, 数码: 13, 知识: 14, 娱乐: 15,
+  放映厅: 16, 运动: 17, 鬼畜: 20, 汽车: 24, 资讯: 25, 番剧: 29, 科技: 30, 国创: 31, 影视: 32,
+};
+// '82.2w' → 822000；认不出给 null
+const num = (s) => {
+  const m = String(s ?? '').replace(/[,+\s]/g, '').match(/^([\d.]+)(w|万|亿)?$/i);
+  return m ? Math.round(parseFloat(m[1]) * ({ w: 1e4, 万: 1e4, 亿: 1e8 }[m[2]?.toLowerCase()] ?? 1)) : null;
+};
+
+async function feiguaBoard(ctx, category) {
+  const cat = CATEGORIES[category];
+  if (cat == null) throw new Error(`飞瓜 B站版没有「${category}」这个分区（可选：${Object.keys(CATEGORIES).join('、')}）`);
+  const guess = shift(dayIn(Date.now()), -1).replaceAll('-', '');
+  const html = await ctx.http.text(`${FG}/ranking/RiseFansv2/${guess}/1/${cat}.html`);
+  // 页面实际给的是哪一期：周期按钮组里高亮的「日榜」按钮带着期次
+  const ymd = html.match(/el-button--primary\s*"\s*data-date="(\d{8})"\s*data-v="1"/)?.[1];
+  if (!ymd) throw new Error('飞瓜 B站版榜单页里没找到日榜期次，页面结构可能变了');
+  const rows = [];
+  for (const row of html.split('<div class="list-row">').slice(1)) {
+    const rank = row.match(/class="rank_index">\s*(\d+)/)?.[1];
+    const name = row.match(/<img [^>]*alt="([^"]*)"/)?.[1];
+    const detail = row.match(/data-jp="(\/ShowBlogger\/Detail\/\w+)/)?.[1];
+    const [followers, gain] = [...row.matchAll(/<div class="col-item[^"]*" style="width: 100px;">([^<]*)<\/div>/g)].map((m) => m[1].trim());
+    if (rank && name && detail) rows.push({ rank: +rank, name, gain: num(gain), followers: num(followers), detail });
+  }
+  if (!rows.length) throw new Error(`飞瓜 B站版 ${ymd} 期「${category}」榜没解析出条目`);
+  const entries = [];
+  for (const r of rows.slice(0, ctx.opts.top)) {
+    await sleep(800);
+    const mid = (await ctx.http.text(FG + r.detail)).match(/UID:\s*<span>\s*(\d+)\s*<\/span>/)?.[1];
+    if (!mid) { ctx.log(`飞瓜详情页没有 ${r.name} 的 UID，跳过`); continue; }
+    entries.push({ rank: r.rank, name: r.name, gain: r.gain, followers: r.followers, ref: { mid } });
+  }
+  if (ctx.opts.top > rows.length) ctx.log(`飞瓜 B站版免登录只列前 ${rows.length} 名`);
+  return {
+    date: `${ymd.slice(0, 4)}-${ymd.slice(4, 6)}-${ymd.slice(6)}`,
+    period: `日榜·${category}（飞瓜前 ${rows.length} 名）`,
+    url: `${FG}/ranking/RiseFansv2/${ymd}/1/${cat}.html`,
+    entries,
+  };
+}
+
+export async function board(ctx, { category } = {}) {
+  if (category != null) return feiguaBoard(ctx, category);
   const { items } = await ctx.http.json('https://zeroroku.com/api/bilibili/fans-trend?period=7&direction=up');
   if (!items?.length) throw new Error('zeroroku 返回空榜');
   return {
@@ -80,9 +128,26 @@ async function peakDay(ctx, mid, board) {
   return peak;
 }
 
+// 主页链接 → mid（space.bilibili.com/<mid>）；b23.tv 短链跟随跳转
+export async function parseUrl(ctx, url) {
+  let u = url.trim();
+  if (/b23\.tv/.test(u)) {
+    const res = await ctx.http.request(u, { redirect: 'manual' });
+    u = res.headers.get('location') || u;
+  }
+  const mid = u.match(/space\.bilibili\.com\/(\d+)/)?.[1];
+  if (!mid) throw new Error('认不出 B站主页链接（要 space.bilibili.com/ 开头的个人空间地址）');
+  return { mid };
+}
+
 export async function works(ctx, entry, board) {
   const { mid } = entry.ref;
   const peak = await peakDay(ctx, mid, board).catch((e) => { ctx.log(`${entry.name} 逐日涨粉取不到（${e.message}）`); return null; });
+  // 卡片接口：认证类型（Official.type：1 机构认证，0 个人认证，-1 没认证），指定账号模式还要靠它补粉丝数
+  const card = await api(ctx, '/x/web-interface/card', { mid }).catch((e) => { ctx.log(`${entry.name} 卡片接口失败（${e.message}）`); return null; });
+  const followers = entry.followers ?? card?.follower ?? null;
+  const official = card?.card?.Official?.type;
+  const org = official == null ? null : official === 1;
   const data = await api(ctx, '/x/space/wbi/arc/search',
     { mid, ps: 30, pn: 1, order: 'pubdate', platform: 'web', web_location: 1550101, order_avoided: 'true', ...DM }, { signed: true });
   const vlist = data.list?.vlist ?? [];
@@ -114,7 +179,7 @@ export async function works(ctx, entry, board) {
       title: d?.title ?? v.title,
       type: 'video',
       published_at: cstISO(d?.pubdate ?? v.created),
-      duration: d?.duration ?? null,
+      duration: d?.duration ?? (v.length ? v.length.split(':').reduce((t, x) => t * 60 + +x, 0) : null), // 列表的 length 是 'mm:ss'
       metrics: {
         plays: s?.view ?? v.play ?? null,
         likes: s?.like ?? null,
@@ -128,7 +193,7 @@ export async function works(ctx, entry, board) {
   }
 
   return {
-    creator: { id: mid, name: vlist[0]?.author ?? entry.name, url: `https://space.bilibili.com/${mid}`, followers: entry.followers },
+    creator: { id: mid, name: vlist[0]?.author ?? entry.name, url: `https://space.bilibili.com/${mid}`, followers, org },
     works: list,
     note: notes.join('；'),
     peak,

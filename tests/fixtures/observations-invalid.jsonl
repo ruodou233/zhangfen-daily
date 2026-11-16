@@ -1,2 +1,0 @@
-{"schema_version":2,"account_key":"youtube:bad_demo","observed_at":"not-a-date","follower_count":100,"source":"source-a","status":"active","count_exact":true,"count_resolution":1000,"provider_as_of":"2026-07-18T00:00:00Z","below_resolution":true,"delta":7}
-{"schema_version":2,"account_key":"youtube:bad_demo","observed_at":"2026-07-19T00:00:00Z","follower_count":110,"source":"source-b","status":"active","count_exact":true,"count_resolution":1,"provider_as_of":"2026-07-18T00:00:00Z","below_resolution":false,"delta":10}

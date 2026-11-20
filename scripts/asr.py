@@ -61,7 +61,7 @@ def find_model():
     for d in sorted(glob.glob(f"{hub}/models--mlx-community--whisper-large-v3-turbo/snapshots/*/")):
         if glob.glob(d + "weights.*"):
             return d
-    sys.exit("本地没有 whisper-large-v3-turbo，先下载：huggingface-cli download mlx-community/whisper-large-v3-turbo")
+    sys.exit("本地没有 whisper-large-v3-turbo，先下载：hf download mlx-community/whisper-large-v3-turbo")
 
 
 RUNNING = {}  # 正在跑的 ffmpeg

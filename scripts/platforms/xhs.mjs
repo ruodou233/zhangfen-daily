@@ -166,6 +166,7 @@ function pick(entry, cands) {
   return { why: `站内搜索「${entry.name}」的 ${cands.length} 个候选账号里没有头像/昵称/粉丝量两项以上吻合的${near.length ? `（只有一项吻合：${near.join('、')}）` : ''}` };
 }
 
+// 直接打开 search_result 只适合少量搜索（日报每天十来个作者）；连续搜很多词会被跳到验证码，那时要改在站内输入框里搜
 async function findUser(ctx, entry) {
   const has = (p, re) => p.responses.some((r) => re.test(r.url));
   for (let tries = 1; ; tries++) {

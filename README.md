@@ -61,7 +61,7 @@ B站 滚动7日（11-03） ｜ 抖音 日榜（11-02） ｜ 小红书 日榜（1
   ```bash
   pip install mlx-whisper "yt-dlp[default]"
   brew install ffmpeg
-  huggingface-cli download mlx-community/whisper-large-v3-turbo
+  hf download mlx-community/whisper-large-v3-turbo
   ```
 
   脚本会自动寻找能 `import mlx_whisper` 的 Python；找不到时用 `--python` 或环境变量 `ZF_PYTHON` 指定。yt-dlp 可用 `ZF_YTDLP` 指定可执行文件。
